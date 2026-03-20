@@ -1,0 +1,44 @@
+import { Request, Response, NextFunction } from 'express';
+import { ZodError } from 'zod';
+import { AppError, ErrorCode } from '../utils/app-error.util';
+import { failureResponse, buildMeta } from '../utils/response.util';
+import { logger } from '../config/logger.config';
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+export function errorMiddleware(err: unknown, req: Request, res: Response, _next: NextFunction): void {
+  const requestId = (res.locals['requestId'] as string | undefined) ?? 'unknown';
+  const startTime = (res.locals['startTime'] as number | undefined) ?? Date.now();
+  const meta      = buildMeta(requestId, startTime);
+
+  if (err instanceof AppError) {
+    logger.warn('Application error', {
+      code:      err.code,
+      message:   err.message,
+      path:      req.path,
+      requestId,
+    });
+    res.status(err.statusCode).json(
+      failureResponse(err.code, err.message, meta, err.details),
+    );
+    return;
+  }
+
+  if (err instanceof ZodError) {
+    logger.warn('Validation error', { path: req.path, requestId, issues: err.flatten() });
+    res.status(400).json(
+      failureResponse(
+        ErrorCode.VALIDATION_ERROR,
+        'Request validation failed',
+        meta,
+        { issues: err.flatten() },
+      ),
+    );
+    return;
+  }
+
+  const message = err instanceof Error ? err.message : 'Unexpected error';
+  logger.error('Unhandled error', { err, path: req.path, requestId });
+  res.status(500).json(
+    failureResponse(ErrorCode.INTERNAL_ERROR, message, meta),
+  );
+}
