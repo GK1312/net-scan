@@ -94,6 +94,13 @@ export function executeVBScript(
         logger.warn('VBScript stderr', { context, stderr: stderr.slice(0, 500) });
       }
 
+      // Surface stderr in the result so callers can see the actual cscript error
+      // when stdout is empty (e.g. Option Explicit compile errors, syntax errors).
+      if (!stdout && stderr) {
+        resolve({ stdout: `{"__error":${JSON.stringify(stderr.trim().slice(0, 500))}}`, stderr, exitCode: code ?? 1 });
+        return;
+      }
+
       resolve({ stdout, stderr, exitCode: code ?? 1 });
     });
 

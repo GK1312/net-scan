@@ -23,23 +23,41 @@ import {
   executeVBScript,
 } from '../../../../utils/vbscript.util';
 import { parsePsOutput } from '../../../../utils/powershell.util';
-import { tcpPortCheck } from '../../../../utils/ssh.util';
+import { tcpPortCheck, isLocalTarget } from '../../../../utils/ssh.util';
 import { appConfig } from '../../../../config/app.config';
 
 // ─── Shared VBScript JSON helpers (injected at top of every script) ───────────
 const VBS_HELPERS = `
-Option Explicit
-
 Function JStr(s)
-    Dim v
+    Dim i, c, code, result, v, hx
     If IsNull(s) Or IsEmpty(s) Then JStr = "null" : Exit Function
     v = CStr(s)
-    v = Replace(v, "\\", "\\\\")
-    v = Replace(v, """", "\\""")
-    v = Replace(v, Chr(10), "\\n")
-    v = Replace(v, Chr(13), "\\r")
-    v = Replace(v, Chr(9), "\\t")
-    JStr = """" & v & """"
+    result = ""
+    For i = 1 To Len(v)
+        c = Mid(v, i, 1)
+        code = AscW(c)
+        If code < 0 Then code = code + 65536
+        If code = 34 Then
+            result = result & "\\"""
+        ElseIf code = 92 Then
+            result = result & "\\\\"
+        ElseIf code = 10 Then
+            result = result & "\\n"
+        ElseIf code = 13 Then
+            result = result & "\\r"
+        ElseIf code = 9 Then
+            result = result & "\\t"
+        ElseIf code < 32 Then
+            hx = Hex(code)
+            result = result & "\\u00" & Right("0" & hx, 2)
+        ElseIf code > 127 Then
+            hx = Hex(code)
+            result = result & "\\u" & Right("000" & hx, 4)
+        Else
+            result = result & c
+        End If
+    Next
+    JStr = """" & result & """"
 End Function
 
 Function JNum(n)
@@ -85,14 +103,18 @@ ${credBlock}
 Dim locator, svc
 Set locator = CreateObject("WbemScripting.SWbemLocator")
 If Err.Number <> 0 Then
-    WScript.Echo "{""__error"":""WMI locator failed: " & Replace(Err.Description, """", "'") & """}"
+    WScript.StdOut.Write "{""__error"":" & JStr("WMI locator failed: " & Err.Description) & "}"
     WScript.Quit 1
 End If
 Err.Clear
 
-Set svc = locator.ConnectServer(sTarget, "root\\cimv2", sUser, sPass)
+If sUser = "" Then
+    Set svc = locator.ConnectServer(sTarget, "root\\cimv2")
+Else
+    Set svc = locator.ConnectServer(sTarget, "root\\cimv2", sUser, sPass)
+End If
 If Err.Number <> 0 Then
-    WScript.Echo "{""__error"":""WMI connect failed: " & Replace(Err.Description, """", "'") & """}"
+    WScript.StdOut.Write "{""__error"":" & JStr("WMI connect failed: " & Err.Description) & "}"
     WScript.Quit 1
 End If
 svc.Security_.ImpersonationLevel = 3
@@ -191,6 +213,7 @@ For Each net In svc.ExecQuery("SELECT Description,MACAddress,IPAddress FROM Win3
     netJson = netJson & "{""Name"":" & JStr(net.Description) & ",""MacAddress"":" & JStr(net.MACAddress) & ",""IpAddresses"":" & ipJson & "}"
     netCount = netCount + 1
 Next
+netJson = netJson & "]"
 Err.Clear
 
 ' ── Win32_ComputerSystemProduct ──────────────────────────────────────────────
@@ -251,7 +274,7 @@ o = o & """TotalSockets"":" & JNum(csNumProc) & ","
 o = o & """TotalCores"":" & CStr(totalCores) & ","
 o = o & """CoresPerSocket"":" & JNum(cpuCores)
 o = o & "}"
-WScript.Echo o
+WScript.StdOut.Write(o)
 `;
 }
 
@@ -266,12 +289,16 @@ ${credBlock}
 Dim locator, svc
 Set locator = CreateObject("WbemScripting.SWbemLocator")
 If Err.Number <> 0 Then
-    WScript.Echo "{""__error"":""WMI locator failed""}"
+    WScript.StdOut.Write "{""__error"":""WMI locator failed""}"
     WScript.Quit 1
 End If
-Set svc = locator.ConnectServer(sTarget, "root\\default", sUser, sPass)
+If sUser = "" Then
+    Set svc = locator.ConnectServer(sTarget, "root\\default")
+Else
+    Set svc = locator.ConnectServer(sTarget, "root\\default", sUser, sPass)
+End If
 If Err.Number <> 0 Then
-    WScript.Echo "{""__error"":""WMI connect failed: " & Replace(Err.Description, """", "'") & """}"
+    WScript.StdOut.Write "{""__error"":" & JStr("WMI connect failed: " & Err.Description) & "}"
     WScript.Quit 1
 End If
 svc.Security_.ImpersonationLevel = 3
@@ -359,7 +386,7 @@ For p = 0 To 1
 Next
 
 appsJson = appsJson & "]"
-WScript.Echo appsJson
+WScript.StdOut.Write(appsJson)
 `;
 }
 
@@ -374,16 +401,21 @@ ${credBlock}
 Dim locator, svc
 Set locator = CreateObject("WbemScripting.SWbemLocator")
 If Err.Number <> 0 Then
-    WScript.Echo "{""success"":false,""__error"":""WMI locator failed""}"
+    WScript.StdOut.Write "{""success"":false,""__error"":""WMI locator failed""}"
     WScript.Quit 1
 End If
-Set svc = locator.ConnectServer(sTarget, "root\\cimv2", sUser, sPass)
+If sUser = "" Then
+    Set svc = locator.ConnectServer(sTarget, "root\\cimv2")
+Else
+    Set svc = locator.ConnectServer(sTarget, "root\\cimv2", sUser, sPass)
+End If
 If Err.Number <> 0 Then
-    WScript.Echo "{""success"":false,""__error"":""" & Replace(Err.Description, """", "'") & """}"
+    WScript.StdOut.Write "{""success"":false,""__error"":" & JStr(Err.Description) & "}"
     WScript.Quit 1
 End If
 svc.Security_.ImpersonationLevel = 3
 svc.Security_.AuthenticationLevel = 6
+Err.Clear
 
 Dim caption : caption = ""
 Dim os
@@ -392,11 +424,20 @@ For Each os In svc.ExecQuery("SELECT Caption FROM Win32_OperatingSystem")
 Next
 
 If Err.Number <> 0 Then
-    WScript.Echo "{""success"":false,""__error"":""" & Replace(Err.Description, """", "'") & """}"
+    WScript.StdOut.Write "{""success"":false,""__error"":" & JStr(Err.Description) & "}"
 Else
-    WScript.Echo "{""success"":true,""caption"":" & JStr(caption) & "}"
+    WScript.StdOut.Write "{""success"":true,""caption"":" & JStr(caption) & "}"
 End If
 `;
+}
+
+// ─── Local-target credential block ────────────────────────────────────────────
+// When scanning the local machine via its own IP, Windows UAC remote token
+// filtering strips admin privileges from the DCOM connection, causing access
+// denied even with correct credentials.  Connecting via "." (no network path)
+// uses the current process security context and bypasses UAC filtering.
+function localCredBlock(): string {
+  return `Dim sTarget, sUser, sPass\nsTarget = "."\nsUser = ""\nsPass = ""\n`;
 }
 
 // ─── Method Class ─────────────────────────────────────────────────────────────
@@ -404,14 +445,20 @@ export class WmiMethod extends BaseMethod {
   readonly methodName = ScanMethod.WMI;
 
   async testConnection(target: string, credentials: ScanCredentials): Promise<ConnectionTestResult> {
-    // Fast TCP pre-check on RPC endpoint mapper port to avoid long DCOM timeout
-    const portOpen = await tcpPortCheck(target, 135, 3000);
-    if (!portOpen) {
-      return { success: false, target, method: this.methodName, error: `WMI/RPC port 135 is not reachable on ${target}` };
+    const local = isLocalTarget(target);
+
+    // For remote targets do a fast TCP pre-check on the RPC endpoint mapper
+    // port to avoid waiting out the full DCOM timeout on unreachable hosts.
+    // Skip the check for local targets — local WMI uses IPC, not TCP 135.
+    if (!local) {
+      const portOpen = await tcpPortCheck(target, 135, 3000);
+      if (!portOpen) {
+        return { success: false, target, method: this.methodName, error: `WMI/RPC port 135 is not reachable on ${target}` };
+      }
     }
 
     try {
-      const credBlock = buildVbsCredentialBlock(target, credentials);
+      const credBlock = local ? localCredBlock() : buildVbsCredentialBlock(target, credentials);
       const result    = await executeVBScript(buildConnectionTestScript(credBlock), {
         timeoutMs: appConfig.ps.connectTimeoutMs,
         context: `${this.methodName}:testConnection:${target}`,
@@ -429,7 +476,7 @@ export class WmiMethod extends BaseMethod {
   }
 
   async fetchHardwareInfo(target: string, credentials: ScanCredentials): Promise<HardwareInfo> {
-    const credBlock = buildVbsCredentialBlock(target, credentials);
+    const credBlock = isLocalTarget(target) ? localCredBlock() : buildVbsCredentialBlock(target, credentials);
     const result    = await executeVBScript(buildHardwareScript(credBlock), {
       timeoutMs: appConfig.ps.executionTimeoutMs,
       context: `${this.methodName}:hardware:${target}`,
@@ -438,7 +485,7 @@ export class WmiMethod extends BaseMethod {
   }
 
   async fetchSoftwareInfo(target: string, credentials: ScanCredentials): Promise<SoftwareEntry[]> {
-    const credBlock = buildVbsCredentialBlock(target, credentials);
+    const credBlock = isLocalTarget(target) ? localCredBlock() : buildVbsCredentialBlock(target, credentials);
     const result    = await executeVBScript(buildSoftwareScript(credBlock), {
       timeoutMs: appConfig.ps.executionTimeoutMs,
       context: `${this.methodName}:software:${target}`,

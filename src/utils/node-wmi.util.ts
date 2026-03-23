@@ -40,6 +40,20 @@ export function wmiQuery(opts: WmiQueryOptions): Promise<Record<string, unknown>
     where, namespace, timeoutMs = 30_000, context,
   } = opts;
 
+  // node-wmi wraps credentials with single quotes when building the wmic.exe
+  // command line (e.g. /USER:'it techvits').  Windows does not treat single
+  // quotes as string delimiters, so a username containing a space causes wmic
+  // to split the argument and report "Alias not found".  Use the "wmi"
+  // (VBScript) or "powershell" method instead for accounts with spaces.
+  if (username.includes(' ')) {
+    return Promise.reject(new AppError(
+      503,
+      ErrorCode.PS_EXECUTION_FAILED,
+      `node-wmi does not support usernames with spaces ("${username}"). ` +
+      `Use the "wmi" (VBScript) or "powershell" scan method instead.`,
+    ));
+  }
+
   return new Promise((resolve, reject) => {
     logger.debug('node-wmi query', { context, host, class: wmiClass });
 

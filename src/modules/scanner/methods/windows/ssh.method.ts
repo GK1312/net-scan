@@ -29,6 +29,7 @@ import {
   parseOsArchFromSystemInfo,
   logSshWarning,
   tcpPortCheck,
+  isLocalTarget,
 } from '../../../../utils/ssh.util';
 import { appConfig } from '../../../../config/app.config';
 import { logger } from '../../../../config/logger.config';
@@ -46,7 +47,10 @@ export class SshMethod extends BaseMethod {
     // Fast TCP pre-check to avoid waiting the full SSH handshake timeout
     const portOpen = await tcpPortCheck(target, SSH_PORT, 3000);
     if (!portOpen) {
-      return { success: false, target, method: this.methodName, error: `SSH port ${SSH_PORT} is not reachable on ${target}` };
+      const hint = isLocalTarget(target)
+        ? ` — install OpenSSH Server: Settings > Apps > Optional features > "OpenSSH Server"`
+        : '';
+      return { success: false, target, method: this.methodName, error: `SSH port ${SSH_PORT} is not reachable on ${target}${hint}` };
     }
 
     try {

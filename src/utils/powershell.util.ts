@@ -30,10 +30,27 @@ export function buildCredentialBlock(target: string, creds: ScanCredentials): st
   return `
 # PS5.1 COMPATIBLE - do not use PS7-only syntax
 $ErrorActionPreference = 'Stop'
+$__local    = $false
 $__target   = '${escapedTarget}'
 $__username = '${escapedUser}'
 $__password = ConvertTo-SecureString '${escapedPassword}' -AsPlainText -Force
 $__cred     = New-Object System.Management.Automation.PSCredential($__username, $__password)
+`;
+}
+
+/**
+ * Credential block for local-machine scans.
+ * Sets $__local = $true so script branches skip WinRM remoting and run
+ * WMI queries directly — bypassing WinRM loopback restrictions and UAC
+ * remote token filtering that block self-scans via the machine's own IP.
+ */
+export function buildLocalCredentialBlock(): string {
+  return `
+# PS5.1 COMPATIBLE - do not use PS7-only syntax
+$ErrorActionPreference = 'Stop'
+$__local  = $true
+$__target = 'localhost'
+$__cred   = $null
 `;
 }
 
@@ -120,13 +137,21 @@ export function parsePsOutput<T>(raw: string, context: string): T {
 
   let parsed: unknown;
   try {
-    // Find the last JSON object/array in stdout (PS may print warnings before the JSON)
-    const lastJsonMatch = trimmed.match(/(\{[\s\S]*\}|\[[\s\S]*\])(?=[^{[\]]*$)/);
-    parsed = JSON.parse(lastJsonMatch ? lastJsonMatch[0] : trimmed);
-  } catch {
+    // Try direct parse first; fall back to extracting the last JSON object/array
+    // (PS/VBS may print warnings before the JSON payload)
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      const lastJsonMatch = trimmed.match(/(\{[\s\S]*\}|\[[\s\S]*\])(?=[^{[\]]*$)/);
+      if (!lastJsonMatch) throw new Error('no_json_found');
+      parsed = JSON.parse(lastJsonMatch[0]);
+    }
+  } catch (e) {
+    const parseMsg = e instanceof SyntaxError ? e.message : String(e);
     throw new AppError(500, ErrorCode.PARSE_ERROR, `Failed to parse PowerShell JSON output`, {
       context,
-      raw: trimmed.slice(0, 1000),
+      parseError: parseMsg,
+      raw: trimmed.slice(0, 3000),
     });
   }
 

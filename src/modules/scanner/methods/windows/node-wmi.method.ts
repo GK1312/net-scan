@@ -32,7 +32,7 @@ import {
   safeBool,
   dmtfToIso,
 } from '../../../../utils/node-wmi.util';
-import { tcpPortCheck } from '../../../../utils/ssh.util';
+import { tcpPortCheck, isLocalTarget } from '../../../../utils/ssh.util';
 import { appConfig } from '../../../../config/app.config';
 import { logger } from '../../../../config/logger.config';
 
@@ -46,17 +46,22 @@ export class NodeWmiMethod extends BaseMethod {
   // ── Connection test ─────────────────────────────────────────────────────────
 
   async testConnection(target: string, credentials: ScanCredentials): Promise<ConnectionTestResult> {
-    // Fast TCP pre-check on RPC endpoint mapper port to avoid long DCOM timeout
-    const portOpen = await tcpPortCheck(target, 135, 3000);
-    if (!portOpen) {
-      return { success: false, target, method: this.methodName, error: `WMI/RPC port 135 is not reachable on ${target}` };
+    const local = isLocalTarget(target);
+
+    if (!local) {
+      // Fast TCP pre-check on RPC endpoint mapper port to avoid long DCOM timeout.
+      // Skip for local targets — local WMI uses IPC, not TCP 135.
+      const portOpen = await tcpPortCheck(target, 135, 3000);
+      if (!portOpen) {
+        return { success: false, target, method: this.methodName, error: `WMI/RPC port 135 is not reachable on ${target}` };
+      }
     }
 
     try {
       const rows = await wmiQuery({
-        host:       target,
-        username:   fullUsername(credentials),
-        password:   credentials.password,
+        host:       local ? 'localhost' : target,
+        username:   local ? ''          : fullUsername(credentials),
+        password:   local ? ''          : credentials.password,
         wmiClass:   'Win32_OperatingSystem',
         properties: ['Caption'],
         timeoutMs:  appConfig.ps.connectTimeoutMs,
@@ -77,12 +82,16 @@ export class NodeWmiMethod extends BaseMethod {
 
   async fetchHardwareInfo(target: string, credentials: ScanCredentials): Promise<HardwareInfo> {
     const context = `${this.methodName}:hardware:${target}`;
+    const local   = isLocalTarget(target);
+    const host     = local ? 'localhost'              : target;
+    const username = local ? ''                       : fullUsername(credentials);
+    const password = local ? ''                       : credentials.password;
 
     const q = (wmiClass: string, properties: string[], where?: string) =>
       wmiQuery({
-        host: target,
-        username: fullUsername(credentials),
-        password: credentials.password,
+        host,
+        username,
+        password,
         wmiClass,
         properties,
         where,
@@ -114,9 +123,9 @@ export class NodeWmiMethod extends BaseMethod {
       [cspRows, licRows] = await Promise.all([
         q('Win32_ComputerSystemProduct', ['Name', 'Vendor', 'Version']),
         wmiQuery({
-          host:       target,
-          username:   fullUsername(credentials),
-          password:   credentials.password,
+          host,
+          username,
+          password,
           wmiClass:   'SoftwareLicensingProduct',
           properties: ['Name', 'Description', 'ProductKeyLastFive'],
           where:      "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND LicenseStatus=1",
@@ -212,10 +221,11 @@ export class NodeWmiMethod extends BaseMethod {
       { context },
     );
 
+    const local = isLocalTarget(target);
     const rows = await wmiQuery({
-      host:       target,
-      username:   fullUsername(credentials),
-      password:   credentials.password,
+      host:       local ? 'localhost'           : target,
+      username:   local ? ''                    : fullUsername(credentials),
+      password:   local ? ''                    : credentials.password,
       wmiClass:   'Win32_Product',
       properties: ['Name', 'Version', 'Vendor', 'InstallDate', 'IdentifyingNumber'],
       // Give Win32_Product plenty of time

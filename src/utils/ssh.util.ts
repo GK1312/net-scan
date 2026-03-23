@@ -4,6 +4,7 @@
  * and parses their output into structured data.
  */
 import { createConnection } from 'net';
+import { networkInterfaces } from 'os';
 import { Client, ConnectConfig } from 'ssh2';
 import {
   HardwareInfo,
@@ -13,6 +14,25 @@ import {
 } from '../types/scanner.types';
 import { AppError, ErrorCode } from './app-error.util';
 import { logger } from '../config/logger.config';
+
+/**
+ * Returns true if the given IP/hostname refers to this machine.
+ * Used to detect self-scans so the scanner can use local WMI instead of
+ * remote DCOM — bypassing UAC remote token filtering (which causes access
+ * denied even with valid admin credentials when connecting to oneself via IP).
+ */
+export function isLocalTarget(ip: string): boolean {
+  if (ip === 'localhost' || ip === '127.0.0.1' || ip === '::1') return true;
+  const nets = networkInterfaces();
+  for (const iface of Object.values(nets)) {
+    if (iface) {
+      for (const net of iface) {
+        if (net.address === ip) return true;
+      }
+    }
+  }
+  return false;
+}
 
 /**
  * Fast TCP port reachability check using a raw socket with a timeout.
