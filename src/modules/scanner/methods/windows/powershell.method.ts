@@ -164,12 +164,7 @@ ${credBlock}
     if (-not $portOpen) {
         Write-Output (@{ success = $false; __error = "WinRM port 5985 is not reachable on $__target" } | ConvertTo-Json -Compress)
     } else {
-        if ($PSVersionTable.PSVersion.Major -ge 7) {
-            $so = New-PSSessionOption -OpenTimeoutMSec 6000 -OperationTimeoutMSec 6000
-        } else {
-            $so = New-PSSessionOption -OpenTimeout 6000 -OperationTimeout 6000
-        }
-        $result = Invoke-Command -ComputerName $__target -Credential $__cred -SessionOption $so -ErrorAction Stop -ScriptBlock {
+        $result = Invoke-Command -ComputerName $__target -Credential $__cred -ErrorAction Stop -ScriptBlock {
             @{ success = $true; caption = (Get-WmiObject Win32_OperatingSystem).Caption } | ConvertTo-Json -Compress
         }
         Write-Output $result
