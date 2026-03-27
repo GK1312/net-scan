@@ -10,20 +10,20 @@
  *
  * Use this method when the client allows PowerShell access.
  */
-import { BaseMethod } from '../base.method';
+import { BaseMethod } from "../base.method";
 import {
   ScanMethod,
   ScanCredentials,
   ConnectionTestResult,
   HardwareInfo,
   SoftwareEntry,
-} from '../../../../types/scanner.types';
+} from "../../../../types/scanner.types";
 import {
   buildCredentialBlock,
   executePowerShell,
-} from '../../../../utils/powershell.util';
-import { isLocalTarget } from '../../../../utils/ssh.util';
-import { appConfig } from '../../../../config/app.config';
+} from "../../../../utils/powershell.util";
+import { isLocalTarget } from "../../../../utils/ssh.util";
+import { appConfig } from "../../../../config/app.config";
 
 // ─── Remote Hardware Script (WinRM / Invoke-Command) ─────────────────────────
 function buildHardwareScript(credBlock: string): string {
@@ -164,7 +164,11 @@ ${credBlock}
     if (-not $portOpen) {
         Write-Output (@{ success = $false; __error = "WinRM port 5985 is not reachable on $__target" } | ConvertTo-Json -Compress)
     } else {
-        $so = New-PSSessionOption -OpenTimeout 6000 -OperationTimeout 6000
+        if ($PSVersionTable.PSVersion.Major -ge 7) {
+            $so = New-PSSessionOption -OpenTimeoutMSec 6000 -OperationTimeoutMSec 6000
+        } else {
+            $so = New-PSSessionOption -OpenTimeout 6000 -OperationTimeout 6000
+        }
         $result = Invoke-Command -ComputerName $__target -Credential $__cred -SessionOption $so -ErrorAction Stop -ScriptBlock {
             @{ success = $true; caption = (Get-WmiObject Win32_OperatingSystem).Caption } | ConvertTo-Json -Compress
         }
@@ -315,9 +319,12 @@ try {
 export class PowerShellMethod extends BaseMethod {
   readonly methodName = ScanMethod.POWERSHELL;
 
-  async testConnection(target: string, credentials: ScanCredentials): Promise<ConnectionTestResult> {
+  async testConnection(
+    target: string,
+    credentials: ScanCredentials,
+  ): Promise<ConnectionTestResult> {
     try {
-      const local  = isLocalTarget(target);
+      const local = isLocalTarget(target);
       const script = local
         ? buildLocalConnectionTestScript()
         : buildConnectionTestScript(buildCredentialBlock(target, credentials));
@@ -326,10 +333,23 @@ export class PowerShellMethod extends BaseMethod {
         context: `${this.methodName}:testConnection:${target}`,
       });
       if (!result.stdout.trim()) {
-        return { success: false, target, method: this.methodName, error: 'PowerShell returned no output' };
+        return {
+          success: false,
+          target,
+          method: this.methodName,
+          error: "PowerShell returned no output",
+        };
       }
-      const parsed = this.parseJson<{ success: boolean; __error?: string }>(result.stdout, 'testConnection');
-      return { success: parsed.success, target, method: this.methodName, ...(parsed.__error ? { error: parsed.__error } : {}) };
+      const parsed = this.parseJson<{ success: boolean; __error?: string }>(
+        result.stdout,
+        "testConnection",
+      );
+      return {
+        success: parsed.success,
+        target,
+        method: this.methodName,
+        ...(parsed.__error ? { error: parsed.__error } : {}),
+      };
     } catch (err) {
       return {
         success: false,
@@ -340,8 +360,11 @@ export class PowerShellMethod extends BaseMethod {
     }
   }
 
-  async fetchHardwareInfo(target: string, credentials: ScanCredentials): Promise<HardwareInfo> {
-    const local  = isLocalTarget(target);
+  async fetchHardwareInfo(
+    target: string,
+    credentials: ScanCredentials,
+  ): Promise<HardwareInfo> {
+    const local = isLocalTarget(target);
     const script = local
       ? buildLocalHardwareScript()
       : buildHardwareScript(buildCredentialBlock(target, credentials));
@@ -349,11 +372,14 @@ export class PowerShellMethod extends BaseMethod {
       timeoutMs: appConfig.ps.executionTimeoutMs,
       context: `${this.methodName}:hardware:${target}`,
     });
-    return this.parseJson<HardwareInfo>(result.stdout, 'hardware');
+    return this.parseJson<HardwareInfo>(result.stdout, "hardware");
   }
 
-  async fetchSoftwareInfo(target: string, credentials: ScanCredentials): Promise<SoftwareEntry[]> {
-    const local  = isLocalTarget(target);
+  async fetchSoftwareInfo(
+    target: string,
+    credentials: ScanCredentials,
+  ): Promise<SoftwareEntry[]> {
+    const local = isLocalTarget(target);
     const script = local
       ? buildLocalSoftwareScript()
       : buildSoftwareScript(buildCredentialBlock(target, credentials));
@@ -361,7 +387,10 @@ export class PowerShellMethod extends BaseMethod {
       timeoutMs: appConfig.ps.executionTimeoutMs,
       context: `${this.methodName}:software:${target}`,
     });
-    const parsed = this.parseJson<SoftwareEntry[] | SoftwareEntry>(result.stdout, 'software');
+    const parsed = this.parseJson<SoftwareEntry[] | SoftwareEntry>(
+      result.stdout,
+      "software",
+    );
     return Array.isArray(parsed) ? parsed : [parsed];
   }
 }
