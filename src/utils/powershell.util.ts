@@ -144,7 +144,8 @@ export function executePowerShell(
       if (stderr) {
         logger.warn("PowerShell stderr output", {
           context,
-          stderr: stderr.slice(0, 500),
+          exitCode,
+          stderr,
         });
       }
 
