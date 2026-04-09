@@ -59,6 +59,28 @@ try {
             $licDesc = if ($lic[0].Description)       { $lic[0].Description }       else { '' }
             $licKey  = if ($lic[0].ProductKeyLastFive) { $lic[0].ProductKeyLastFive } else { '' }
         }
+        if ($licKey -eq '') {
+            $sls = Get-WmiObject SoftwareLicensingService -ErrorAction SilentlyContinue
+            if ($sls -and $sls.OA3xOriginalProductKey) {
+                $oaKey = [string]$sls.OA3xOriginalProductKey
+                $licKey = if ($oaKey.Length -ge 5) { $oaKey.Substring($oaKey.Length - 5) } else { $oaKey }
+            }
+        }
+        if ($licKey -eq '') {
+            try {
+                $slmgrOut = (cmd /c "cscript //nologo ""$env:SystemRoot\System32\slmgr.vbs"" /dli") -join [char]10
+                $pkm = [regex]::Match($slmgrOut, '(?m)^Partial Product Key:\s*(.+)')
+                if ($pkm.Success) { $licKey = $pkm.Groups[1].Value.Trim() }
+                if ($licName -eq '') {
+                    $nm = [regex]::Match($slmgrOut, '(?m)^Name:\s*(.+)')
+                    if ($nm.Success) { $licName = $nm.Groups[1].Value.Trim() }
+                }
+                if ($licDesc -eq '') {
+                    $dm = [regex]::Match($slmgrOut, '(?m)^Description:\s*(.+)')
+                    if ($dm.Success) { $licDesc = $dm.Groups[1].Value.Trim() }
+                }
+            } catch {}
+        }
         $cspName = ''; $cspVendor = ''; $cspVersion = ''
         if ($csp) {
             $cspName    = if ($csp.Name)    { $csp.Name }    else { '' }
@@ -101,6 +123,7 @@ try {
             NetworkAdapters           = $netList
             TotalSockets              = [int]$cs.NumberOfProcessors
             TotalCores                = $totalCores; CoresPerSocket = $coresPerSocket
+            BiosSerialNumber          = if ($os.SerialNumber) { $os.SerialNumber } else { '' }
         } | ConvertTo-Json -Compress -Depth 5
     }
     Write-Output $hw
@@ -225,6 +248,28 @@ try {
         $licDesc = if ($lic[0].Description)       { $lic[0].Description }       else { '' }
         $licKey  = if ($lic[0].ProductKeyLastFive) { $lic[0].ProductKeyLastFive } else { '' }
     }
+    if ($licKey -eq '') {
+        $sls = Get-WmiObject SoftwareLicensingService -ErrorAction SilentlyContinue
+        if ($sls -and $sls.OA3xOriginalProductKey) {
+            $oaKey = [string]$sls.OA3xOriginalProductKey
+            $licKey = if ($oaKey.Length -ge 5) { $oaKey.Substring($oaKey.Length - 5) } else { $oaKey }
+        }
+    }
+    if ($licKey -eq '') {
+        try {
+            $slmgrOut = (cmd /c "cscript //nologo ""$env:SystemRoot\System32\slmgr.vbs"" /dli") -join [char]10
+            $pkm = [regex]::Match($slmgrOut, '(?m)^Partial Product Key:\s*(.+)')
+            if ($pkm.Success) { $licKey = $pkm.Groups[1].Value.Trim() }
+            if ($licName -eq '') {
+                $nm = [regex]::Match($slmgrOut, '(?m)^Name:\s*(.+)')
+                if ($nm.Success) { $licName = $nm.Groups[1].Value.Trim() }
+            }
+            if ($licDesc -eq '') {
+                $dm = [regex]::Match($slmgrOut, '(?m)^Description:\s*(.+)')
+                if ($dm.Success) { $licDesc = $dm.Groups[1].Value.Trim() }
+            }
+        } catch {}
+    }
     $cspName = ''; $cspVendor = ''; $cspVersion = ''
     if ($csp) {
         $cspName    = if ($csp.Name)    { $csp.Name }    else { '' }
@@ -267,6 +312,7 @@ try {
         NetworkAdapters           = $netList
         TotalSockets              = [int]$cs.NumberOfProcessors
         TotalCores                = $totalCores; CoresPerSocket = $coresPerSocket
+        BiosSerialNumber          = if ($os.SerialNumber) { $os.SerialNumber } else { '' }
     } | ConvertTo-Json -Compress -Depth 5
 } catch {
     @{ __error = $_.Exception.Message } | ConvertTo-Json -Compress

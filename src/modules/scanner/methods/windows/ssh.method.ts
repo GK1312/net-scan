@@ -199,7 +199,7 @@ export class SshMethod extends BaseMethod {
       try {
         const { stdout: osOut, exitCode: osExit } = await execSshCommand(
           conn,
-          "wmic os get BootDevice,BuildNumber,Caption,InstallDate,Manufacturer,Name,OSArchitecture,RegisteredUser,WindowsDirectory /format:csv",
+          "wmic os get BootDevice,BuildNumber,Caption,InstallDate,Manufacturer,Name,OSArchitecture,RegisteredUser,SerialNumber,WindowsDirectory /format:csv",
           15000,
         );
         if (osExit === 0 && osOut.trim()) {
@@ -226,6 +226,7 @@ export class SshMethod extends BaseMethod {
             if (dmtf.length >= 14) {
               hw.OsInstallDate = `${dmtf.slice(0, 4)}-${dmtf.slice(4, 6)}-${dmtf.slice(6, 8)}T${dmtf.slice(8, 10)}:${dmtf.slice(10, 12)}:${dmtf.slice(12, 14)}`;
             }
+            hw.BiosSerialNumber = osRow["SerialNumber"]?.trim() || "";
           }
         }
       } catch (err) {
@@ -235,7 +236,7 @@ export class SshMethod extends BaseMethod {
       try {
         const { stdout: cspOut, exitCode: cspExit } = await execSshCommand(
           conn,
-          "wmic computersystemproduct get Name,Vendor,Version /format:csv",
+          "wmic path Win32_ComputerSystemProduct get Name,Vendor,Version /format:csv",
           10000,
         );
         if (cspExit === 0 && cspOut.trim()) {
@@ -252,24 +253,43 @@ export class SshMethod extends BaseMethod {
       }
 
       try {
-        const { stdout: licOut, exitCode: licExit } = await execSshCommand(
+        const { stdout: slsOut, exitCode: slsExit } = await execSshCommand(
           conn,
-          `wmic path SoftwareLicensingProduct where "ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' and LicenseStatus=1" get Name,Description,ProductKeyLastFive /format:csv`,
-          15000,
+          "wmic path SoftwareLicensingService get OA3xOriginalProductKey /format:csv",
+          10000,
         );
-        if (licExit === 0 && licOut.trim()) {
-          const licRows = parseWmicCsvRows(licOut);
-          const lic = licRows[0];
-          if (lic) {
-            hw.LicenseName = lic["Name"]?.trim() || hw.LicenseName;
-            hw.LicenseDescription =
-              lic["Description"]?.trim() || hw.LicenseDescription;
-            hw.LicenseProductKey =
-              lic["ProductKeyLastFive"]?.trim() || hw.LicenseProductKey;
+        if (slsExit === 0 && slsOut.trim()) {
+          const slsRows = parseWmicCsvRows(slsOut);
+          const oaKey = slsRows[0]?.["OA3xOriginalProductKey"]?.trim() || "";
+          if (oaKey) {
+            hw.LicenseProductKey = oaKey.length >= 5 ? oaKey.slice(-5) : oaKey;
           }
         }
       } catch (err) {
-        logSshWarning(context, "wmic licensing", err);
+        logSshWarning(context, "wmic SoftwareLicensingService", err);
+      }
+
+      // slmgr.vbs fills Name, Description, and Key (if OA3xOriginalProductKey is empty)
+      try {
+        const { stdout: licOut, exitCode: licExit } = await execSshCommand(
+          conn,
+          "cscript //nologo %SystemRoot%\\System32\\slmgr.vbs /dli",
+          20000,
+        );
+        if (licExit === 0 && licOut.trim()) {
+          const parseSlmgr = (out: string, key: string): string => {
+            const match = new RegExp(`^${key}:\\s*(.+)$`, "mi").exec(out);
+            return match ? match[1].trim() : "";
+          };
+          hw.LicenseName = parseSlmgr(licOut, "Name") || hw.LicenseName;
+          hw.LicenseDescription =
+            parseSlmgr(licOut, "Description") || hw.LicenseDescription;
+          if (!hw.LicenseProductKey) {
+            hw.LicenseProductKey = parseSlmgr(licOut, "Partial Product Key");
+          }
+        }
+      } catch (err) {
+        logSshWarning(context, "slmgr licensing", err);
       }
 
       try {
@@ -319,16 +339,17 @@ export class SshMethod extends BaseMethod {
           15000,
         );
         if (exitCode === 0 && diskOut.trim()) {
-          // Filter DriveType=3 (local disks)
+          // WMIC outputs columns alphabetically: Node,Caption,DriveType,Size
+          // parts[0]=Node, parts[1]=Caption, parts[2]=DriveType, parts[3]=Size
           const csvLines = diskOut.split(/\r?\n/).filter((l) => {
             const parts = l.split(",");
-            return parts.length >= 4 && parts[3]?.trim() === "3";
+            return parts.length >= 4 && parts[2]?.trim() === "3";
           });
           // Rebuild CSV for parser: Node,Caption,Size
           const adjustedCsv = csvLines
             .map((l) => {
               const parts = l.split(",");
-              return `${parts[0]},${parts[1]},${parts[2]}`;
+              return `${parts[0]},${parts[1]},${parts[3]}`;
             })
             .join("\n");
           hw.Disks = parseWmicDiskOutput(adjustedCsv);

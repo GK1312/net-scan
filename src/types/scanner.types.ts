@@ -1,18 +1,18 @@
 export enum OsType {
-  WINDOWS = 'windows',
-  LINUX   = 'linux',
-  MAC     = 'mac',
+  WINDOWS = "windows",
+  LINUX = "linux",
+  MAC = "mac",
 }
 
 export enum ScanMethod {
   /** Uses PowerShell Remoting (Invoke-Command) over WinRM — requires Enable-PSRemoting on target */
-  POWERSHELL = 'powershell',
+  POWERSHELL = "powershell",
   /** Uses VBScript + cscript.exe with WbemScripting.SWbemLocator over DCOM — PowerShell independent */
-  WMI        = 'wmi',
+  WMI = "wmi",
   /** Uses SSH (ssh2) + CMD commands (systeminfo, reg query) — no PowerShell or WMI required */
-  SSH        = 'ssh',
+  SSH = "ssh",
   /** Uses node-wmi npm package to query WMI over DCOM — pure Node.js, no temp files, no spawned helpers */
-  NODE_WMI   = 'node-wmi',
+  NODE_WMI = "node-wmi",
 }
 
 export interface ScanCredentials {
@@ -85,6 +85,7 @@ export interface HardwareInfo {
   TotalSockets: number;
   TotalCores: number;
   CoresPerSocket: number;
+  BiosSerialNumber: string;
 }
 
 export interface SoftwareEntry {

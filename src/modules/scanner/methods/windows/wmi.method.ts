@@ -10,21 +10,21 @@
  *
  * Use this method when the client has PowerShell disabled/restricted.
  */
-import { BaseMethod } from '../base.method';
+import { BaseMethod } from "../base.method";
 import {
   ScanMethod,
   ScanCredentials,
   ConnectionTestResult,
   HardwareInfo,
   SoftwareEntry,
-} from '../../../../types/scanner.types';
+} from "../../../../types/scanner.types";
 import {
   buildVbsCredentialBlock,
   executeVBScript,
-} from '../../../../utils/vbscript.util';
-import { parsePsOutput } from '../../../../utils/powershell.util';
-import { tcpPortCheck, isLocalTarget } from '../../../../utils/ssh.util';
-import { appConfig } from '../../../../config/app.config';
+} from "../../../../utils/vbscript.util";
+import { parsePsOutput } from "../../../../utils/powershell.util";
+import { tcpPortCheck, isLocalTarget } from "../../../../utils/ssh.util";
+import { appConfig } from "../../../../config/app.config";
 
 // ─── Shared VBScript JSON helpers (injected at top of every script) ───────────
 const VBS_HELPERS = `
@@ -141,18 +141,18 @@ Next
 Err.Clear
 
 ' ── Win32_OperatingSystem ────────────────────────────────────────────────────
-Dim osBoot,osBuild,osCaption,osInstall,osMfr,osName,osArch,osOwner,osWinDir
-osBoot="":osBuild="":osCaption="":osInstall="":osMfr="":osName="":osArch="":osOwner="":osWinDir=""
+Dim osBoot,osBuild,osCaption,osInstall,osMfr,osName,osArch,osOwner,osSerial,osWinDir
+osBoot="":osBuild="":osCaption="":osInstall="":osMfr="":osName="":osArch="":osOwner="":osSerial="":osWinDir=""
 
 Dim os
-For Each os In svc.ExecQuery("SELECT BootDevice,BuildNumber,Caption,InstallDate,Manufacturer,Name,OSArchitecture,RegisteredUser,WindowsDirectory FROM Win32_OperatingSystem")
+For Each os In svc.ExecQuery("SELECT BootDevice,BuildNumber,Caption,InstallDate,Manufacturer,Name,OSArchitecture,RegisteredUser,SerialNumber,WindowsDirectory FROM Win32_OperatingSystem")
     osBoot=os.BootDevice: osBuild=os.BuildNumber: osCaption=os.Caption
     If Not IsNull(os.InstallDate) Then
         Dim dt : dt = os.ConvertToDateTime(os.InstallDate)
         osInstall = CStr(Year(dt)) & "-" & Right("0"&Month(dt),2) & "-" & Right("0"&Day(dt),2) & "T" & Right("0"&Hour(dt),2) & ":" & Right("0"&Minute(dt),2) & ":" & Right("0"&Second(dt),2)
     End If
     osMfr=os.Manufacturer: osName=os.Name: osArch=os.OSArchitecture
-    osOwner=os.RegisteredUser: osWinDir=os.WindowsDirectory
+    osOwner=os.RegisteredUser: osSerial=os.SerialNumber: osWinDir=os.WindowsDirectory
     Exit For
 Next
 If InStr(osName,"|") > 0 Then osName = Left(osName, InStr(osName,"|")-1)
@@ -193,6 +193,14 @@ For Each gpu In svc.ExecQuery("SELECT Name FROM Win32_VideoController")
 Next
 Err.Clear
 
+' ── Win32_BIOS ──────────────────────────────────────────────────────────────
+Dim biosSerial : biosSerial=""
+Dim bios
+For Each bios In svc.ExecQuery("SELECT SerialNumber FROM Win32_BIOS")
+    biosSerial=bios.SerialNumber: Exit For
+Next
+Err.Clear
+
 ' ── Win32_NetworkAdapterConfiguration ────────────────────────────────────────
 Dim netJson, netCount
 netJson="[": netCount=0
@@ -224,13 +232,46 @@ For Each csp In svc.ExecQuery("SELECT Name,Vendor,Version FROM Win32_ComputerSys
 Next
 Err.Clear
 
-' ── SoftwareLicensingProduct ─────────────────────────────────────────────────
+' ── SoftwareLicensingProduct (with slmgr.vbs fallback) ──────────────────────
 Dim licName,licDesc,licKey : licName="":licDesc="":licKey=""
 Dim lic
 For Each lic In svc.ExecQuery("SELECT Name,Description,ProductKeyLastFive FROM SoftwareLicensingProduct WHERE ApplicationId='55c92734-d682-4d71-983e-d6ec3f16059f' AND LicenseStatus=1")
     licName=lic.Name: licDesc=lic.Description: licKey=lic.ProductKeyLastFive: Exit For
 Next
 Err.Clear
+' Fallback: SoftwareLicensingProduct fails on many Windows builds via VBScript/WMIC.
+' OA3xOriginalProductKey: OEM/UEFI embedded key.
+If licKey = "" Then
+    Dim slsSvc
+    For Each slsSvc In svc.ExecQuery("SELECT OA3xOriginalProductKey FROM SoftwareLicensingService")
+        Dim oaRaw : oaRaw = ""
+        If Not IsNull(slsSvc.OA3xOriginalProductKey) Then oaRaw = Trim(slsSvc.OA3xOriginalProductKey)
+        If oaRaw <> "" Then
+            If Len(oaRaw) >= 5 Then licKey = Right(oaRaw, 5) Else licKey = oaRaw
+        End If
+        Exit For
+    Next
+    Err.Clear
+End If
+' cscript slmgr.vbs /dli reliably returns Name, Description and Partial Product Key.
+If licKey = "" Then
+    On Error Resume Next
+    Dim oSh : Set oSh = CreateObject("WScript.Shell")
+    Dim oEx : Set oEx = oSh.Exec("cscript //nologo """ & oSh.ExpandEnvironmentStrings("%SystemRoot%") & "\System32\slmgr.vbs"" /dli")
+    Dim slOut : slOut = ""
+    Do While Not oEx.StdOut.AtEndOfStream
+        slOut = slOut & oEx.StdOut.ReadLine() & Chr(10)
+    Loop
+    Dim slArr : slArr = Split(slOut, Chr(10))
+    Dim slLn
+    For Each slLn In slArr
+        slLn = Trim(slLn)
+        If Left(slLn,5) = "Name:" And licName = "" Then licName = Trim(Mid(slLn,6))
+        If Left(slLn,12) = "Description:" And licDesc = "" Then licDesc = Trim(Mid(slLn,13))
+        If Left(slLn,20) = "Partial Product Key:" Then licKey = Trim(Mid(slLn,21))
+    Next
+    Err.Clear
+End If
 
 ' ── Output JSON ──────────────────────────────────────────────────────────────
 Dim o
@@ -272,7 +313,8 @@ o = o & """GraphicsCard"":" & JStr(gpuName) & ","
 o = o & """NetworkAdapters"":" & netJson & ","
 o = o & """TotalSockets"":" & JNum(csNumProc) & ","
 o = o & """TotalCores"":" & CStr(totalCores) & ","
-o = o & """CoresPerSocket"":" & JNum(cpuCores)
+o = o & "\"CoresPerSocket\":" & JNum(cpuCores) & ","
+o = o & "\"BiosSerialNumber\":" & JStr(osSerial)
 o = o & "}"
 WScript.StdOut.Write(o)
 `;
@@ -444,7 +486,10 @@ function localCredBlock(): string {
 export class WmiMethod extends BaseMethod {
   readonly methodName = ScanMethod.WMI;
 
-  async testConnection(target: string, credentials: ScanCredentials): Promise<ConnectionTestResult> {
+  async testConnection(
+    target: string,
+    credentials: ScanCredentials,
+  ): Promise<ConnectionTestResult> {
     const local = isLocalTarget(target);
 
     // For remote targets do a fast TCP pre-check on the RPC endpoint mapper
@@ -453,18 +498,36 @@ export class WmiMethod extends BaseMethod {
     if (!local) {
       const portOpen = await tcpPortCheck(target, 135, 3000);
       if (!portOpen) {
-        return { success: false, target, method: this.methodName, error: `WMI/RPC port 135 is not reachable on ${target}` };
+        return {
+          success: false,
+          target,
+          method: this.methodName,
+          error: `WMI/RPC port 135 is not reachable on ${target}`,
+        };
       }
     }
 
     try {
-      const credBlock = local ? localCredBlock() : buildVbsCredentialBlock(target, credentials);
-      const result    = await executeVBScript(buildConnectionTestScript(credBlock), {
-        timeoutMs: appConfig.ps.connectTimeoutMs,
-        context: `${this.methodName}:testConnection:${target}`,
-      });
-      const parsed = parsePsOutput<{ success: boolean; __error?: string }>(result.stdout, 'testConnection');
-      return { success: parsed.success, target, method: this.methodName, ...(parsed.__error ? { error: parsed.__error } : {}) };
+      const credBlock = local
+        ? localCredBlock()
+        : buildVbsCredentialBlock(target, credentials);
+      const result = await executeVBScript(
+        buildConnectionTestScript(credBlock),
+        {
+          timeoutMs: appConfig.ps.connectTimeoutMs,
+          context: `${this.methodName}:testConnection:${target}`,
+        },
+      );
+      const parsed = parsePsOutput<{ success: boolean; __error?: string }>(
+        result.stdout,
+        "testConnection",
+      );
+      return {
+        success: parsed.success,
+        target,
+        method: this.methodName,
+        ...(parsed.__error ? { error: parsed.__error } : {}),
+      };
     } catch (err) {
       return {
         success: false,
@@ -475,22 +538,35 @@ export class WmiMethod extends BaseMethod {
     }
   }
 
-  async fetchHardwareInfo(target: string, credentials: ScanCredentials): Promise<HardwareInfo> {
-    const credBlock = isLocalTarget(target) ? localCredBlock() : buildVbsCredentialBlock(target, credentials);
-    const result    = await executeVBScript(buildHardwareScript(credBlock), {
+  async fetchHardwareInfo(
+    target: string,
+    credentials: ScanCredentials,
+  ): Promise<HardwareInfo> {
+    const credBlock = isLocalTarget(target)
+      ? localCredBlock()
+      : buildVbsCredentialBlock(target, credentials);
+    const result = await executeVBScript(buildHardwareScript(credBlock), {
       timeoutMs: appConfig.ps.executionTimeoutMs,
       context: `${this.methodName}:hardware:${target}`,
     });
-    return parsePsOutput<HardwareInfo>(result.stdout, 'hardware');
+    return parsePsOutput<HardwareInfo>(result.stdout, "hardware");
   }
 
-  async fetchSoftwareInfo(target: string, credentials: ScanCredentials): Promise<SoftwareEntry[]> {
-    const credBlock = isLocalTarget(target) ? localCredBlock() : buildVbsCredentialBlock(target, credentials);
-    const result    = await executeVBScript(buildSoftwareScript(credBlock), {
+  async fetchSoftwareInfo(
+    target: string,
+    credentials: ScanCredentials,
+  ): Promise<SoftwareEntry[]> {
+    const credBlock = isLocalTarget(target)
+      ? localCredBlock()
+      : buildVbsCredentialBlock(target, credentials);
+    const result = await executeVBScript(buildSoftwareScript(credBlock), {
       timeoutMs: appConfig.ps.executionTimeoutMs,
       context: `${this.methodName}:software:${target}`,
     });
-    const parsed = parsePsOutput<SoftwareEntry[] | SoftwareEntry>(result.stdout, 'software');
+    const parsed = parsePsOutput<SoftwareEntry[] | SoftwareEntry>(
+      result.stdout,
+      "software",
+    );
     return Array.isArray(parsed) ? parsed : [parsed];
   }
 }

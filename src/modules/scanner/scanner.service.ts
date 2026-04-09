@@ -185,6 +185,7 @@ function normalizeHardware(target: string, rawHardware: unknown): HardwareInfo {
     TotalSockets: toNum(pick(raw, "TotalSockets", "Total_Sockets")),
     TotalCores: toNum(pick(raw, "TotalCores", "Total_Cores")),
     CoresPerSocket: toNum(pick(raw, "CoresPerSocket", "Cores_Per_Socket")),
+    BiosSerialNumber: toStr(pick(raw, "BiosSerialNumber", "Serial_Number")),
 
     // CSV-style aliases required by downstream exports/consumers.
     HostName:
@@ -237,6 +238,7 @@ function normalizeHardware(target: string, rawHardware: unknown): HardwareInfo {
     Total_Sockets: toNum(pick(raw, "Total_Sockets", "TotalSockets")),
     Total_Cores: toNum(pick(raw, "Total_Cores", "TotalCores")),
     Cores_Per_Socket: toNum(pick(raw, "Cores_Per_Socket", "CoresPerSocket")),
+    Serial_Number: toStr(pick(raw, "Serial_Number", "BiosSerialNumber")),
     Last_Scan_Time:
       toStr(pick(raw, "Last_Scan_Time")) || formatLastScanTime(new Date()),
     DisksLabel: toStr(pick(raw, "Disks")) || disksLabel,
