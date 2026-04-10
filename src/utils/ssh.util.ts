@@ -108,7 +108,19 @@ export function createSshClient(
           "diffie-hellman-group14-sha1",
         ],
       },
+      // Windows OpenSSH often uses keyboard-interactive instead of plain
+      // password auth. Supplying tryKeyboard lets ssh2 respond automatically
+      // to the password prompt sent via that mechanism.
+      tryKeyboard: true,
     };
+    conn.on(
+      "keyboard-interactive",
+      (_name, _instructions, _lang, prompts, finish) => {
+        // Respond to every prompt (there is typically just one: "Password: ")
+        // with the supplied password so the user doesn't see an auth failure.
+        finish(prompts.map(() => password));
+      },
+    );
     conn.connect(config);
   });
 }
