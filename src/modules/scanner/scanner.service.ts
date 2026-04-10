@@ -279,8 +279,16 @@ function normalizeSoftware(
 
 export class ScannerService {
   async ping(target: string): Promise<PingResult> {
+    const t0 = Date.now();
     logger.debug("Pinging target", { target });
-    return pingHost(target);
+    const result = await pingHost(target);
+    logger.debug("Ping done", {
+      target,
+      alive: result.alive,
+      latencyMs: result.latencyMs,
+      durationMs: Date.now() - t0,
+    });
+    return result;
   }
 
   async testConnection(
@@ -288,9 +296,18 @@ export class ScannerService {
     method: ScanMethod,
     credentials: ScanCredentials,
   ): Promise<ConnectionTestResult> {
+    const t0 = Date.now();
     logger.debug("Testing connection", { target, method });
     const handler = getMethod(method);
-    return handler.testConnection(target, credentials);
+    const result = await handler.testConnection(target, credentials);
+    logger.debug("Connection test done", {
+      target,
+      method,
+      success: result.success,
+      error: result.error,
+      durationMs: Date.now() - t0,
+    });
+    return result;
   }
 
   async fetchHardware(
@@ -298,9 +315,16 @@ export class ScannerService {
     method: ScanMethod,
     credentials: ScanCredentials,
   ): Promise<HardwareInfo> {
+    const t0 = Date.now();
     logger.debug("Fetching hardware info", { target, method });
     const raw = await getMethod(method).fetchHardwareInfo(target, credentials);
-    return normalizeHardware(target, raw);
+    const normalized = normalizeHardware(target, raw);
+    logger.debug("Hardware fetch done", {
+      target,
+      method,
+      durationMs: Date.now() - t0,
+    });
+    return normalized;
   }
 
   async fetchSoftware(
@@ -308,9 +332,17 @@ export class ScannerService {
     method: ScanMethod,
     credentials: ScanCredentials,
   ): Promise<SoftwareEntry[]> {
+    const t0 = Date.now();
     logger.debug("Fetching software info", { target, method });
     const raw = await getMethod(method).fetchSoftwareInfo(target, credentials);
-    return normalizeSoftware(target, raw);
+    const normalized = normalizeSoftware(target, raw);
+    logger.debug("Software fetch done", {
+      target,
+      method,
+      count: normalized.length,
+      durationMs: Date.now() - t0,
+    });
+    return normalized;
   }
 
   async fullScan(options: FullScanOptions): Promise<ScanResult> {

@@ -107,6 +107,13 @@ export function executePowerShell(
         ]
       : ["-NonInteractive", "-NoProfile", "-File", scriptPath];
 
+    logger.debug("Spawning PowerShell", {
+      context,
+      executable: psExe,
+      scriptPath,
+      timeoutMs,
+    });
+
     const child = spawn(psExe, psArgs, { stdio: ["ignore", "pipe", "pipe"] });
 
     function cleanup(): void {

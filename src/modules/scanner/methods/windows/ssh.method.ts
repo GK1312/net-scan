@@ -89,6 +89,7 @@ export class SshMethod extends BaseMethod {
     credentials: ScanCredentials,
   ): Promise<HardwareInfo> {
     const context = `${this.methodName}:hardware:${target}`;
+    logger.debug("SSH hardware scan starting", { context, target });
     if (!(await tcpPortCheck(target, SSH_PORT, 3000))) {
       throw new Error(`SSH port ${SSH_PORT} is not reachable on ${target}`);
     }
@@ -102,15 +103,21 @@ export class SshMethod extends BaseMethod {
 
     try {
       // ── systeminfo ─────────────────────────────────────────────────────────
+      logger.debug("SSH: running systeminfo", { context });
       const { stdout: sysOut } = await execSshCommand(
         conn,
         "systeminfo",
         appConfig.ps.executionTimeoutMs,
       );
       const hw = parseSystemInfo(sysOut) as HardwareInfo;
+      logger.debug("SSH: systeminfo done", {
+        context,
+        lines: sysOut.split("\n").length,
+      });
 
       // ── richer WMIC details for required fields ──────────────────────────
       try {
+        logger.debug("SSH: running wmic cpu", { context });
         const { stdout: cpuOut, exitCode: cpuExit } = await execSshCommand(
           conn,
           "wmic cpu get Name,MaxClockSpeed,CurrentClockSpeed,NumberOfCores,NumberOfLogicalProcessors /format:csv",
@@ -370,6 +377,7 @@ export class SshMethod extends BaseMethod {
     credentials: ScanCredentials,
   ): Promise<SoftwareEntry[]> {
     const context = `${this.methodName}:software:${target}`;
+    logger.debug("SSH software scan starting", { context, target });
     if (!(await tcpPortCheck(target, SSH_PORT, 3000))) {
       throw new Error(`SSH port ${SSH_PORT} is not reachable on ${target}`);
     }
@@ -391,12 +399,19 @@ export class SshMethod extends BaseMethod {
     try {
       for (const regPath of regPaths) {
         try {
+          logger.debug("SSH: running reg query", { context, regPath });
           const { stdout } = await execSshCommand(
             conn,
             `reg query "${regPath}" /s`,
             appConfig.ps.executionTimeoutMs,
           );
-          allSoftware.push(...parseRegQuery(stdout, regPath));
+          const entries = parseRegQuery(stdout, regPath);
+          logger.debug("SSH: reg query done", {
+            context,
+            regPath,
+            found: entries.length,
+          });
+          allSoftware.push(...entries);
         } catch (err) {
           logSshWarning(context, `reg query ${regPath}`, err);
         }
@@ -407,11 +422,13 @@ export class SshMethod extends BaseMethod {
 
     // Deduplicate
     const seen = new Set<string>();
-    return allSoftware.filter((e) => {
+    const deduped = allSoftware.filter((e) => {
       const key = `${e.ApplicationName}|${e.Version}`;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
+    logger.debug("SSH software scan done", { context, total: deduped.length });
+    return deduped;
   }
 }

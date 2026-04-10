@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY package*.json ./
 
-RUN npm install
+RUN npm ci --omit=dev
 
 COPY .env.example /app/.env
 
@@ -12,6 +12,6 @@ COPY . .
 
 RUN npm run build
 
-EXPOSE 5000
+EXPOSE 3000
 
 CMD ["npm", "start"]

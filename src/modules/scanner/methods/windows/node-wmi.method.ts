@@ -32,6 +32,7 @@ import {
   safeBool,
   dmtfToIso,
 } from "../../../../utils/node-wmi.util";
+import { AppError, ErrorCode } from "../../../../utils/app-error.util";
 import { tcpPortCheck, isLocalTarget } from "../../../../utils/ssh.util";
 import { appConfig } from "../../../../config/app.config";
 import { logger } from "../../../../config/logger.config";
@@ -50,6 +51,16 @@ export class NodeWmiMethod extends BaseMethod {
     target: string,
     credentials: ScanCredentials,
   ): Promise<ConnectionTestResult> {
+    if (process.platform !== "win32") {
+      return {
+        success: false,
+        target,
+        method: this.methodName,
+        error:
+          "node-wmi (WMI over DCOM) is only available on Windows. Use the SSH method when running on Linux.",
+      };
+    }
+
     const local = isLocalTarget(target);
 
     if (!local) {
@@ -93,6 +104,14 @@ export class NodeWmiMethod extends BaseMethod {
     target: string,
     credentials: ScanCredentials,
   ): Promise<HardwareInfo> {
+    if (process.platform !== "win32") {
+      throw new AppError(
+        501,
+        ErrorCode.PS_EXECUTION_FAILED,
+        "node-wmi (WMI over DCOM) is only available on Windows. Use the SSH method when running on Linux.",
+        { context: `${this.methodName}:hardware:${target}` },
+      );
+    }
     const context = `${this.methodName}:hardware:${target}`;
     const local = isLocalTarget(target);
     const host = local ? "localhost" : target;
@@ -326,6 +345,14 @@ export class NodeWmiMethod extends BaseMethod {
     target: string,
     credentials: ScanCredentials,
   ): Promise<SoftwareEntry[]> {
+    if (process.platform !== "win32") {
+      throw new AppError(
+        501,
+        ErrorCode.PS_EXECUTION_FAILED,
+        "node-wmi (WMI over DCOM) is only available on Windows. Use the SSH method when running on Linux.",
+        { context: `${this.methodName}:software:${target}` },
+      );
+    }
     const context = `${this.methodName}:software:${target}`;
 
     /**
