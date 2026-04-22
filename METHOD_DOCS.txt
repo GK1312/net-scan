@@ -1,0 +1,1253 @@
+================================================================================
+  NET-SCAN-BACKEND  —  COMPLETE METHOD DOCUMENTATION
+================================================================================
+  Every method in the codebase, what it does, where it is used, how it works,
+  and at the end: how to handle 10,000 IPs in parallel.
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 1 — UTILITY METHODS  (src/utils/)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/utils/ping.util.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  pingHost(target, timeoutMs?)
+  ─────────────────────────────
+  WHERE USED : ScannerService.ping(), ScannerService.fullScan() Step 1
+  SIGNATURE  : pingHost(target: string, timeoutMs?: number): Promise<PingResult>
+  DEFAULT    : timeoutMs = 5000 ms
+
+  HOW IT WORKS:
+    1. Detects whether the server is running on Windows or Linux.
+    2. Spawns the OS native `ping` command as a child process:
+         Windows : ping -n 1 -w <timeoutMs> <target>
+         Linux   : ping -c 1 -W <timeoutSec> <target>
+    3. Collects stdout + stderr chunks into a buffer.
+    4. A safety timer kills the child process if it runs past timeoutMs + 2s.
+    5. On Windows, exit code 0 does NOT always mean the host is alive
+       (ping.exe exits 0 for "Request timed out" too). So the output text is
+       also checked for "destination host unreachable", "request timed out",
+       or "could not find host" before declaring the host alive.
+    6. Parses latency from output:
+         Windows : "Average = 12ms"
+         Linux   : "time=12.3 ms"
+    7. Returns: { alive: boolean, target, latencyMs?, rawOutput }
+
+  WHEN TO USE IT:
+    - To quickly check whether a machine is reachable before attempting a
+      full WMI/SSH/PowerShell scan (saves time on dead IPs).
+    - Can be called directly via POST /api/v1/scanner/ping if you only
+      need reachability data.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/utils/powershell.util.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  buildCredentialBlock(target, creds)
+  ─────────────────────────────────────
+  WHERE USED : PowerShellMethod (hardware + software scripts)
+  SIGNATURE  : buildCredentialBlock(target: string, creds: ScanCredentials): string
+
+  HOW IT WORKS:
+    Generates the first few lines of every PowerShell script:
+      - Escapes target IP, username, and password for safe use in PS
+        single-quoted strings (replaces ' with '' to prevent injection).
+      - Builds a PSCredential object stored in $__cred.
+      - Sets $__target to the machine IP.
+      - Sets $__local = $false (remote scan).
+    Credentials are embedded in the script body that goes into a temp file,
+    NOT in the process arguments — so they never appear in `ps aux` or task
+    manager output.
+
+  WHEN TO USE IT:
+    Only used internally by PowerShellMethod. Do not call directly.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  buildLocalCredentialBlock()
+  ────────────────────────────
+  WHERE USED : PowerShellMethod (when scanning the local machine itself)
+  SIGNATURE  : buildLocalCredentialBlock(): string
+
+  HOW IT WORKS:
+    Same as buildCredentialBlock but sets $__local = $true and $__target =
+    'localhost'. When $__local is true, the PS scripts run WMI queries
+    directly (Get-WmiObject) instead of via Invoke-Command over WinRM.
+    This bypasses two Windows restrictions:
+      a) WinRM loopback authentication block (you can't Invoke-Command to
+         your own IP without extra config).
+      b) UAC remote token filtering (admin credentials get downgraded when
+         connecting to yourself remotely).
+
+  WHEN TO USE IT:
+    Only used internally by PowerShellMethod. Do not call directly.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  executePowerShell(script, options)
+  ───────────────────────────────────
+  WHERE USED : PowerShellMethod.testConnection(), fetchHardwareInfo(),
+               fetchSoftwareInfo()
+  SIGNATURE  : executePowerShell(script: string, options: PsExecutionOptions):
+               Promise<PsExecutionResult>
+  OPTIONS    : { timeoutMs: number, context?: string }
+
+  HOW IT WORKS:
+    1. Prepends UTF-8 console encoding line to the script.
+    2. Writes the full script to a temp file:
+         Windows: %TEMP%/ns-<uuid>.ps1
+         Linux  : /tmp/ns-<uuid>.ps1
+    3. Spawns the PowerShell executable:
+         Windows: powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File <path>
+         Linux  : pwsh -NonInteractive -NoProfile -File <path>
+       Note: uses -File not -Command so that try/catch blocks work
+       correctly in PowerShell 5.1 when stdout is piped.
+    4. Collects stdout/stderr buffers in parallel.
+    5. A timeout timer kills the process and rejects with PS_TIMEOUT if
+       it exceeds timeoutMs.
+    6. On close, deletes the temp file (cleanup always runs).
+    7. Returns: { stdout: string, stderr: string, exitCode: number }
+
+  WHEN TO USE IT:
+    Only used internally by PowerShellMethod. Do not call directly.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  parsePsOutput<T>(raw, context)
+  ───────────────────────────────
+  WHERE USED : BaseMethod.parseJson(), called by all method implementations
+               after any script execution
+  SIGNATURE  : parsePsOutput<T>(raw: string, context: string): T
+
+  HOW IT WORKS:
+    1. Trims whitespace. Throws PARSE_ERROR if empty.
+    2. Tries JSON.parse(raw) directly.
+    3. If that fails (PowerShell may print warnings before the JSON),
+       falls back to a regex that extracts the last JSON object or array
+       in the output.
+    4. Checks if the parsed object has a "__error" key — this is set by
+       scripts when they catch an exception, so it surfaces as a clean
+       PS_EXECUTION_FAILED error instead of a JSON parse error.
+    5. Returns the typed parsed result.
+
+  WHEN TO USE IT:
+    Only used internally via BaseMethod.parseJson(). Do not call directly.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  escapePsString(value)  [private]
+  ──────────────────────
+  WHERE USED : buildCredentialBlock() internally
+  HOW IT WORKS: Replaces every ' with '' which is how PowerShell single-quoted
+    strings escape single quotes. Prevents credential injection.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/utils/ssh.util.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  isLocalTarget(ip)
+  ──────────────────
+  WHERE USED : WmiMethod, NodeWmiMethod (to decide local vs remote WMI path)
+  SIGNATURE  : isLocalTarget(ip: string): boolean
+
+  HOW IT WORKS:
+    Returns true if the given IP is:
+      - "localhost", "127.0.0.1", or "::1"
+      - Any IP address assigned to a network interface on this machine
+        (reads networkInterfaces() from Node's os module).
+    This matters for WMI methods because scanning yourself via DCOM causes
+    "Access Denied" due to UAC remote token filtering even with valid admin
+    credentials. The fix is to use local WMI queries instead.
+
+  WHEN TO USE IT:
+    Used internally by WmiMethod and NodeWmiMethod. Not a public API.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  tcpPortCheck(host, port, timeoutMs)
+  ─────────────────────────────────────
+  WHERE USED : PowerShellMethod.testConnection(), WmiMethod.testConnection(),
+               NodeWmiMethod.testConnection()
+  SIGNATURE  : tcpPortCheck(host: string, port: number, timeoutMs: number):
+               Promise<boolean>
+
+  HOW IT WORKS:
+    Opens a raw TCP socket to host:port using Node's net.createConnection().
+    If the port accepts the connection within timeoutMs → returns true.
+    If the connection times out or errors → returns false.
+    The socket is immediately destroyed after the check (no data sent).
+    Default timeout used by callers: 3000 ms.
+
+  WHEN TO USE IT:
+    Called automatically during testConnection() to verify the transport
+    port is open before attempting a full auth handshake. Also useful
+    to pre-flight check if WinRM (5985) or RPC (135) is reachable.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  createSshClient(host, username, password, port?, timeoutMs?)
+  ─────────────────────────────────────────────────────────────
+  WHERE USED : SshMethod.testConnection(), SshMethod.fetchHardwareInfo(),
+               SshMethod.fetchSoftwareInfo()
+  SIGNATURE  : createSshClient(host, username, password, port?, timeoutMs?):
+               Promise<Client>
+  DEFAULTS   : port=22, timeoutMs=10000
+
+  HOW IT WORKS:
+    1. Creates an ssh2 Client instance.
+    2. Sets a timeout timer — rejects with PS_TIMEOUT if connect takes
+       longer than timeoutMs.
+    3. Configures key-exchange algorithms including legacy options
+       (diffie-hellman-group14-sha1) to support older Windows OpenSSH
+       servers.
+    4. Enables tryKeyboard: true so it can respond to keyboard-interactive
+       auth (Windows OpenSSH often uses this instead of plain password auth).
+    5. Registers a keyboard-interactive handler that automatically answers
+       every prompt with the supplied password.
+    6. Calls conn.connect() and resolves with the Client on 'ready'.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod. Do not call directly from outside.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  execSshCommand(conn, command, timeoutMs?)
+  ──────────────────────────────────────────
+  WHERE USED : SshMethod (for every remote command: systeminfo, ipconfig,
+               reg query, wmic, powershell -Command)
+  SIGNATURE  : execSshCommand(conn: Client, command: string, timeoutMs?):
+               Promise<{ stdout, stderr, exitCode }>
+  DEFAULT    : timeoutMs = 30000
+
+  HOW IT WORKS:
+    1. Calls conn.exec(command) on the open SSH connection.
+    2. Streams stdout and stderr into buffers.
+    3. A per-command timeout timer destroys the stream and rejects if the
+       command exceeds timeoutMs.
+    4. On stream 'close', resolves with stdout + stderr as UTF-8 strings.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod. Each hardware/software fetch runs
+    multiple execSshCommand calls sequentially over the same connection.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  parseSystemInfo(raw)
+  ─────────────────────
+  WHERE USED : SshMethod.fetchHardwareInfo()
+  SIGNATURE  : parseSystemInfo(raw: string): Partial<HardwareInfo>
+
+  HOW IT WORKS:
+    Parses the text output of the Windows `systeminfo` command.
+    Splits by newline, finds each "Field Name: Value" pair using the
+    colon position, then extracts known fields:
+      - Host Name, OS Name, OS Version, OS Manufacturer, Original Install Date
+      - System Manufacturer, System Model, System Type, Windows Directory
+      - Boot Device, Domain, Registered Owner, Total Physical Memory
+      - Processor info (CPU name + clock speed from the [01]: line)
+    Memory is converted from "16,050 MB" → GB.
+    Build number is extracted from "Build 26100" in the OS Version line.
+    Returns a Partial<HardwareInfo> — fields not available from systeminfo
+    (GPU, disks, adapters) are left as empty defaults and filled later.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod after running `systeminfo` on the target.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  parseIpConfig(raw)
+  ───────────────────
+  WHERE USED : SshMethod.fetchHardwareInfo()
+  SIGNATURE  : parseIpConfig(raw: string): NetworkAdapterInfo[]
+
+  HOW IT WORKS:
+    Parses the text output of `ipconfig /all`.
+    Splits the output into adapter blocks — each block starts with a
+    non-whitespace line containing "adapter".
+    For each block extracts:
+      - Adapter name (from "Ethernet adapter Local Area Connection:")
+      - MAC address (from "Physical Address . . . : AA-BB-CC-DD-EE-FF")
+      - IPv4 addresses (from "IPv4 Address . . . : 192.168.1.10(Preferred)")
+    Returns array of { name, macAddress, ipAddresses[] }.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod after running `ipconfig /all`.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  parseRegQuery(raw, basePath)
+  ─────────────────────────────
+  WHERE USED : SshMethod.fetchSoftwareInfo()
+  SIGNATURE  : parseRegQuery(raw: string, basePath: string): SoftwareEntry[]
+
+  HOW IT WORKS:
+    Parses the text output of `reg query
+    HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall /s`
+    (and the 32-bit WOW6432Node equivalent).
+    Splits by HKEY_ lines to get one section per registry key.
+    Within each section, parses "    ValueName    REG_SZ    ValueData" lines.
+    Extracts: DisplayName, DisplayVersion, Publisher, InstallDate, ProductID.
+    Skips entries without a DisplayName.
+    Deduplicates by ApplicationName|Version|Publisher (some apps appear in
+    both the 64-bit and 32-bit hives).
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod. Called twice — once for 64-bit hive,
+    once for 32-bit hive — results are merged and deduplicated.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  parseWmicDiskOutput(raw)
+  ─────────────────────────
+  WHERE USED : SshMethod.fetchHardwareInfo() (optional disk info via wmic)
+  SIGNATURE  : parseWmicDiskOutput(raw: string): DiskInfo[]
+
+  HOW IT WORKS:
+    Parses CSV output from `wmic diskdrive get Caption,Size /format:csv`.
+    Skips the header line (starts with "Caption").
+    Each data line: Node,Caption,SizeInBytes.
+    Converts bytes to GB (rounded to 2 decimal places).
+    Returns array of { deviceId: string, sizeGB: number }.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod when `wmic` is available on the target.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  parseWmicCsvRows(raw)
+  ──────────────────────
+  WHERE USED : SshMethod (GPU info via wmic path Win32_VideoController)
+  SIGNATURE  : parseWmicCsvRows(raw: string): Array<Record<string, string>>
+
+  HOW IT WORKS:
+    Generic parser for any `wmic ... /format:csv` output.
+    Finds the header line (contains "Node,"), splits by comma to get
+    column names, then maps each data line to a key-value Record.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod for wmic-based queries over SSH.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  parseOsArchFromSystemInfo(raw)
+  ───────────────────────────────
+  WHERE USED : SshMethod.fetchHardwareInfo()
+  SIGNATURE  : parseOsArchFromSystemInfo(raw: string): string
+
+  HOW IT WORKS:
+    Extracts "System Type" from systeminfo output.
+    Returns "64-bit" if the type contains "64", "32-bit" if it contains "32",
+    otherwise returns the raw system type string.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod to populate OsArchitecture.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  logSshWarning(context, label, err)
+  ────────────────────────────────────
+  WHERE USED : SshMethod (in every try/catch around optional data fetches)
+  SIGNATURE  : logSshWarning(context, label, err): void
+
+  HOW IT WORKS:
+    Simple wrapper around logger.warn(). Formats the message as
+    "SSH: <label> step failed, skipping" with error details.
+    Used so that non-critical SSH steps (GPU, disk, software) can fail
+    without throwing — the warning is logged and the scan continues.
+
+  WHEN TO USE IT:
+    Only used internally by SshMethod. Not a public utility.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  extractField(lines, key)  [private]
+  ──────────────────────────
+  WHERE USED : parseSystemInfo() and parseOsArchFromSystemInfo() internally
+  HOW IT WORKS: Iterates lines, splits on first colon, matches the field name
+    case-insensitively, returns the value portion trimmed.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/utils/vbscript.util.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  escapeVbsString(value)
+  ──────────────────────
+  WHERE USED : buildVbsCredentialBlock()
+  SIGNATURE  : escapeVbsString(value: string): string
+
+  HOW IT WORKS:
+    Escapes double-quote characters by doubling them (" → "").
+    This is the only special character inside VBScript double-quoted strings.
+    Prevents credential injection into the VBScript body.
+
+  WHEN TO USE IT:
+    Only used internally by buildVbsCredentialBlock(). Do not call directly.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  buildVbsCredentialBlock(target, creds)
+  ───────────────────────────────────────
+  WHERE USED : WmiMethod (prepended to every VBScript before execution)
+  SIGNATURE  : buildVbsCredentialBlock(target, creds: ScanCredentials): string
+
+  HOW IT WORKS:
+    Generates three VBScript variable declarations:
+      Dim sTarget, sUser, sPass
+      sTarget = "<escaped-ip>"
+      sUser   = "<domain>\<username>"  or just "<username>"
+      sPass   = "<escaped-password>"
+    These variables are used by the WBemScripting.SWbemLocator calls
+    in the actual VBScript body to authenticate to the remote WMI service.
+    Credentials stay in the temp file, not in process args.
+
+  WHEN TO USE IT:
+    Only used internally by WmiMethod. Do not call directly.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  executeVBScript(script, options)
+  ─────────────────────────────────
+  WHERE USED : WmiMethod.testConnection(), fetchHardwareInfo(),
+               fetchSoftwareInfo()
+  SIGNATURE  : executeVBScript(script: string, options: PsExecutionOptions):
+               Promise<PsExecutionResult>
+
+  HOW IT WORKS:
+    1. Immediately rejects with a 501 error if running on Linux
+       (cscript.exe is Windows only).
+    2. Writes the script to a temp file: %TEMP%/ns-<uuid>.vbs
+    3. Spawns: cscript //NoLogo //E:vbscript <path>
+    4. Collects stdout/stderr buffers.
+    5. Timeout timer kills the process and rejects with PS_TIMEOUT.
+    6. On close, deletes the temp file.
+    7. Special case: if stdout is empty but stderr has content, wraps
+       stderr in a JSON __error object so parsePsOutput() can surface
+       it as a clean error message.
+    8. Returns: { stdout, stderr, exitCode }
+
+  WHEN TO USE IT:
+    Only used internally by WmiMethod. Do not call directly.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/utils/response.util.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  successResponse<T>(data, message, meta)
+  ────────────────────────────────────────
+  WHERE USED : Every controller handler (getMethods, ping, testConnection,
+               fetchHardware, fetchSoftware, fullScan)
+  SIGNATURE  : successResponse<T>(data: T, message: string, meta: ApiMeta):
+               ApiSuccess<T>
+
+  HOW IT WORKS:
+    Returns a plain object:
+      { success: true, message: "...", data: <T>, meta: { timestamp, requestId, duration } }
+    Passed directly to res.json(). Ensures all API responses have a
+    consistent envelope shape.
+
+  WHEN TO USE IT:
+    In any controller when the operation succeeds. Do not build raw JSON
+    responses manually — always use this wrapper.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  failureResponse(code, message, meta, details?)
+  ───────────────────────────────────────────────
+  WHERE USED : Error middleware (src/middleware/error.middleware.ts)
+  SIGNATURE  : failureResponse(code, message, meta, details?): ApiFailure
+
+  HOW IT WORKS:
+    Returns:
+      { success: false, message, error: { code, message, details? }, meta }
+    Used by the global error handler to format all error responses
+    consistently regardless of where in the stack the error occurred.
+
+  WHEN TO USE IT:
+    Only called from the error middleware. Controllers should call next(err)
+    and let the middleware use this function.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  buildMeta(requestId, startTime)
+  ────────────────────────────────
+  WHERE USED : ScannerController.getMeta() helper, and error middleware
+  SIGNATURE  : buildMeta(requestId: string, startTime: number): ApiMeta
+
+  HOW IT WORKS:
+    Returns: { timestamp: ISO8601, requestId, duration: Date.now()-startTime }
+    requestId is the UUID attached to every request by the logging middleware.
+    startTime is the high-resolution timestamp attached at request entry.
+    duration is the milliseconds elapsed from request start to response build.
+
+  WHEN TO USE IT:
+    Called in every controller via the getMeta(res) helper function.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/utils/app-error.util.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  AppError (class)
+  ─────────────────
+  WHERE USED : Throughout the entire codebase — every throw statement uses this
+  SIGNATURE  : new AppError(statusCode, code, message, details?)
+
+  HOW IT WORKS:
+    Extends the native Error class. Adds:
+      - statusCode : HTTP status code (400, 500, 503, 504, etc.)
+      - code       : machine-readable error string from ErrorCode enum
+      - details    : optional extra context (never exposed to client in prod)
+    The error middleware checks `instanceof AppError` to decide the HTTP
+    status code to send. Unknown errors get 500.
+
+  WHEN TO USE IT:
+    Throw this anywhere a recoverable or user-facing error should be returned
+    as a structured API response. Never use raw `throw new Error()`.
+
+  ErrorCode constants:
+    VALIDATION_ERROR    — bad request body
+    PING_FAILED         — target did not respond to ICMP
+    CONNECTION_FAILED   — auth or transport failure
+    PS_EXECUTION_FAILED — PowerShell/VBScript script itself failed
+    PS_TIMEOUT          — script or SSH command exceeded timeout
+    PARSE_ERROR         — could not parse JSON output from script
+    UNKNOWN_METHOD      — invalid ScanMethod value
+    NOT_FOUND           — 404 route
+    INTERNAL_ERROR      — unexpected/unhandled error
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 2 — SCANNING METHOD IMPLEMENTATIONS  (src/modules/scanner/methods/)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/methods/base.method.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  BaseMethod (abstract class)
+  ────────────────────────────
+  WHERE USED : Parent class of PowerShellMethod, WmiMethod, SshMethod,
+               NodeWmiMethod
+  PURPOSE    : Defines the interface every scan method must implement.
+
+  Abstract members (all subclasses must implement):
+    - methodName         : the ScanMethod enum value for this implementation
+    - testConnection()   : verify credentials and transport before scanning
+    - fetchHardwareInfo(): retrieve hardware inventory
+    - fetchSoftwareInfo(): retrieve installed software list
+
+  Protected helpers (available to all subclasses):
+    parseJson<T>(raw, context)
+      Calls parsePsOutput() to parse JSON from script stdout.
+      Used after every script execution in every method.
+
+    assertSuccess(result, context)
+      Checks exitCode !== 0. If the script failed, throws PS_EXECUTION_FAILED
+      with the first 500 chars of stderr included for debugging.
+      Used after every executePowerShell() / executeVBScript() call.
+
+  WHEN TO USE IT:
+    Extend BaseMethod when adding a new scan method (e.g., SNMP, WS-Man).
+    Do not instantiate BaseMethod directly — it is abstract.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/methods/method.factory.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  getMethod(method)
+  ──────────────────
+  WHERE USED : ScannerService.testConnection(), fetchHardware(),
+               fetchSoftware(), fullScan()
+  SIGNATURE  : getMethod(method: ScanMethod): BaseMethod
+
+  HOW IT WORKS:
+    Maintains a module-level Map<ScanMethod, BaseMethod>.
+    On first call for a given method → instantiates the correct class.
+    On subsequent calls → returns the cached instance.
+    This singleton pattern means the class is only constructed once per
+    Node.js process, which avoids repeated constructor overhead.
+    Throws UNKNOWN_METHOD (400) if an invalid method string is passed.
+
+  WHEN TO USE IT:
+    Use this instead of directly instantiating method classes. This is
+    the single lookup point for method routing.
+
+  ─────────────────────────────────────────────────────────────────────────────
+
+  getAvailableMethods()
+  ──────────────────────
+  WHERE USED : ScannerController.getMethods() → GET /api/v1/scanner/methods
+  SIGNATURE  : getAvailableMethods(): Array<{ id, name, description,
+               requirements, powershellRequired, linuxCompatible }>
+
+  HOW IT WORKS:
+    Returns a static list of all four scan methods with human-readable
+    descriptions and requirements. Adds a platform warning for WMI and
+    NODE_WMI when the server is running on Linux (process.platform !== 'win32')
+    since those methods require Windows cscript.exe / DCOM.
+
+  WHEN TO USE IT:
+    Call GET /api/v1/scanner/methods from the frontend or API client to
+    let the user choose the appropriate method for their target.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/methods/windows/powershell.method.ts
+  Class: PowerShellMethod
+────────────────────────────────────────────────────────────────────────────────
+
+  METHOD: POWERSHELL
+  TRANSPORT: WinRM HTTP port 5985 / HTTPS 5986
+  REQUIREMENT: Enable-PSRemoting -Force on target, powershell.exe or pwsh on server
+
+  testConnection(target, credentials)
+  ─────────────────────────────────────
+  WHERE USED : ScannerService.testConnection(), ScannerService.fullScan() Step 2
+  HOW IT WORKS:
+    1. Checks if target is local (isLocalTarget) — if yes, returns success
+       without a network test (local WMI always works if you're admin).
+    2. TCP port check on 5985 (WinRM HTTP). If port is closed → returns
+       { success: false, error: "WinRM port 5985 not reachable" }.
+    3. Runs a minimal PS script: builds credential block then runs
+       Invoke-Command { hostname } to verify actual auth over WinRM.
+    4. Returns { success, target, method, error? }.
+
+  fetchHardwareInfo(target, credentials)
+  ───────────────────────────────────────
+  WHERE USED : ScannerService.fetchHardware()
+  HOW IT WORKS:
+    1. Builds credential block + hardware PS script.
+    2. Script uses Invoke-Command (remote) or Get-WmiObject (local) to query:
+         - Win32_ComputerSystem (hostname, domain, RAM, manufacturer, model)
+         - Win32_OperatingSystem (OS name, version, install date)
+         - Win32_Processor (CPU name, clock speeds, cores)
+         - Win32_DiskDrive (disk device IDs and sizes)
+         - Win32_NetworkAdapterConfiguration (IPs, MACs)
+         - Win32_VideoController (GPU name)
+         - Win32_BIOS (serial number)
+         - SoftwareLicensingProduct (Windows license info)
+    3. Script outputs everything as a single JSON object via ConvertTo-Json.
+    4. executePowerShell() runs the script with PS_EXECUTION_TIMEOUT_MS.
+    5. parsePsOutput() parses the JSON.
+    6. ScannerService.normalizeHardware() flattens it to HardwareInfo.
+
+  fetchSoftwareInfo(target, credentials)
+  ───────────────────────────────────────
+  WHERE USED : ScannerService.fetchSoftware()
+  HOW IT WORKS:
+    1. Builds credential block + software PS script.
+    2. Script queries the registry:
+         HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*
+         HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*
+       using Get-ItemProperty (much faster than Win32_Product).
+    3. Deduplicates by DisplayName + DisplayVersion.
+    4. Outputs JSON array via ConvertTo-Json.
+    5. Returns array of SoftwareEntry objects after normalizeSoftware().
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/methods/windows/wmi.method.ts
+  Class: WmiMethod
+────────────────────────────────────────────────────────────────────────────────
+
+  METHOD: WMI (VBScript over DCOM)
+  TRANSPORT: RPC port 135 + dynamic high ports 49152-65535
+  REQUIREMENT: WMI service running on target, WMI firewall exception, Windows server
+
+  testConnection(target, credentials)
+  ─────────────────────────────────────
+  HOW IT WORKS:
+    1. If local target → skip network test, return success.
+    2. TCP port check on 135 (RPC endpoint mapper).
+    3. Runs a minimal VBScript that connects via WbemScripting.SWbemLocator
+       and queries SELECT Name FROM Win32_OperatingSystem.
+    4. Returns success/failure based on VBScript exit code.
+
+  fetchHardwareInfo(target, credentials)
+  ───────────────────────────────────────
+  HOW IT WORKS:
+    1. Builds VBScript credential block + hardware query script.
+    2. VBScript connects via WbemScripting.SWbemLocator to the target's
+       root\cimv2 namespace over DCOM.
+    3. Runs WMI queries (same classes as PowerShell method).
+    4. Outputs JSON by string-building (VBScript has no native JSON — the
+       script manually constructs the JSON string).
+    5. executeVBScript() runs cscript.exe with the temp .vbs file.
+    6. parsePsOutput() parses the output.
+
+  fetchSoftwareInfo(target, credentials)
+  ───────────────────────────────────────
+  HOW IT WORKS:
+    Queries Win32_Product via DCOM for installed software.
+    Note: Win32_Product triggers a Windows Installer consistency check
+    on every call — this is slower than the registry method used by
+    PowerShell and SSH methods. Prefer those when possible.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/methods/windows/ssh.method.ts
+  Class: SshMethod
+────────────────────────────────────────────────────────────────────────────────
+
+  METHOD: SSH
+  TRANSPORT: TCP port 22
+  REQUIREMENT: OpenSSH Server on target (Windows optional feature or Linux sshd)
+
+  testConnection(target, credentials)
+  ─────────────────────────────────────
+  HOW IT WORKS:
+    1. TCP port check on 22.
+    2. createSshClient() — full SSH handshake + auth.
+    3. Runs `echo connected` to verify the session is functional.
+    4. Destroys the test connection.
+    5. Returns success/failure.
+
+  fetchHardwareInfo(target, credentials)
+  ───────────────────────────────────────
+  HOW IT WORKS:
+    1. createSshClient() to open an SSH connection.
+    2. Runs commands sequentially over the same connection:
+         a. `systeminfo`           → parseSystemInfo() → base HardwareInfo
+         b. `ipconfig /all`        → parseIpConfig() → NetworkAdapters
+         c. `wmic diskdrive get Caption,Size /format:csv`
+                                   → parseWmicDiskOutput() → Disks
+         d. `wmic path Win32_VideoController get Caption /format:csv`
+                                   → parseWmicCsvRows() → GraphicsCard
+         e. `powershell -Command "..."` → tries to get license info + extra
+                                          fields not in systeminfo
+    3. Each step is in a try/catch. If it fails, logSshWarning() logs it
+       and the scan continues with whatever data was collected.
+    4. conn.end() closes the SSH connection.
+    5. Returns merged HardwareInfo.
+
+  fetchSoftwareInfo(target, credentials)
+  ───────────────────────────────────────
+  HOW IT WORKS:
+    1. createSshClient().
+    2. Runs two reg query commands sequentially:
+         reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" /s
+         reg query "HKLM\SOFTWARE\WOW6432Node\...\Uninstall" /s
+    3. parseRegQuery() on each output.
+    4. Merges + deduplicates results.
+    5. conn.end().
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/methods/windows/node-wmi.method.ts
+  Class: NodeWmiMethod
+────────────────────────────────────────────────────────────────────────────────
+
+  METHOD: NODE_WMI
+  TRANSPORT: DCOM / RPC port 135 + high ports
+  REQUIREMENT: Windows server (node-wmi uses COM), WMI service on target
+
+  testConnection(target, credentials)
+  ─────────────────────────────────────
+  HOW IT WORKS:
+    TCP port check on 135 + runs a minimal node-wmi query
+    (Win32_OperatingSystem.Name) to verify DCOM auth.
+
+  fetchHardwareInfo(target, credentials)
+  ───────────────────────────────────────
+  HOW IT WORKS:
+    Uses the node-wmi npm package (a native Node.js DCOM client) to run
+    WMI queries directly from Node without spawning cscript.exe.
+    Queries same Win32 classes as the other methods.
+    Credentials stay in Node process memory — no temp files.
+
+  fetchSoftwareInfo(target, credentials)
+  ───────────────────────────────────────
+  HOW IT WORKS:
+    Queries Win32_Product via node-wmi.
+    Same caveat as WmiMethod: Win32_Product is slow (triggers MSI check).
+    Prefer PowerShell or SSH methods for software inventory.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 3 — SERVICE & CONTROLLER METHODS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/scanner.service.ts  (class ScannerService)
+────────────────────────────────────────────────────────────────────────────────
+
+  Private helper functions (module-level, not class methods):
+
+  extractMessage(err)
+  ──────────────────
+  Returns err.message if err is an Error, otherwise String(err).
+  Used everywhere inside fullScan() to safely get a string from any thrown value.
+
+  asRecord(value)
+  ───────────────
+  Casts unknown to Record<string,unknown> if it is a non-null object, else {}.
+  Used by normalizeHardware/normalizeSoftware to safely access fields.
+
+  pick(raw, ...keys)
+  ──────────────────
+  Tries each key in order, returns the first one that exists on the object.
+  Used to handle field name variations (e.g. "Hostname" vs "HostName" vs "hostName").
+
+  toStr(value)
+  ────────────
+  Converts null/undefined/any to string. Returns "" for null/undefined.
+  Trims whitespace.
+
+  toNum(value)
+  ────────────
+  Converts any value to a finite number. Returns 0 for NaN or non-numeric.
+
+  toBool(value)
+  ─────────────
+  Converts any value to boolean. Handles string "true", "1", "yes" as true.
+
+  formatLastScanTime(date)
+  ─────────────────────────
+  Formats a Date as "DD-MM-YYYY HH:MM:SS AM/PM" using en-GB locale.
+  Replaces / with - and formats am/pm to uppercase AM/PM.
+  Used to stamp hardware and software entries with the scan timestamp.
+
+  normalizeHardware(target, rawHardware)
+  ───────────────────────────────────────
+  WHERE USED : ScannerService.fetchHardware(), ScannerService.fullScan() Step 3
+  SIGNATURE  : normalizeHardware(target: string, rawHardware: unknown): HardwareInfo
+
+  HOW IT WORKS:
+    Takes raw hardware data (which may have different field names from
+    PowerShell, WMI, or SSH) and flattens it to a single consistent
+    HardwareInfo object. Key behaviors:
+      - Uses pick() to handle both camelCase and snake_case and PascalCase
+        field names from any scan method.
+      - Normalizes Disks array: picks deviceId from "deviceId", "DeviceId",
+        "DeviceID", or "Caption"; picks sizeGB from "sizeGB", "SizeGB", "Size".
+        Filters out disks with empty deviceId.
+      - Normalizes NetworkAdapters: supports comma-separated or array IP lists.
+      - Computes composite CSV-friendly fields:
+          Drives        = "C: , D:"
+          Size_of_Drives = "C: (Total: 120 GB), D: (Total: 500 GB)"
+          MacAddress    = all MACs joined by ", "
+          IP_Address    = all IPs joined by ", "
+      - Sets Status = "OK" and Remark = "Success" as defaults.
+      - Sets Last_Scan_Time to current timestamp.
+      - Outputs BOTH canonical names (Hostname, TotalPhysicalMemoryGB) AND
+        CSV aliases (HostName, TotalPhysicalMemory (GB)) so downstream
+        export consumers work without a transform layer.
+
+  normalizeSoftware(target, rawSoftware)
+  ───────────────────────────────────────
+  WHERE USED : ScannerService.fetchSoftware(), ScannerService.fullScan() Step 4
+  SIGNATURE  : normalizeSoftware(target, rawSoftware: SoftwareEntry[]): SoftwareEntry[]
+
+  HOW IT WORKS:
+    Maps each raw software entry through the same pick()/toStr() pattern.
+    Handles "ApplicationName" vs "Application_Name".
+    Adds: Hostname, Status="OK", Remark="Successful", Last_Scan_Time.
+    Returns normalized array ready for CSV export.
+
+  ──────────────────────────────────────────────────────────────────────────────
+
+  ScannerService.ping(target)
+  ────────────────────────────
+  WHERE USED : ScannerController.ping() → POST /api/v1/scanner/ping
+  SIGNATURE  : ping(target: string): Promise<PingResult>
+
+  HOW IT WORKS:
+    Wraps pingHost(target) with debug logging (before and after with latency
+    and duration). Returns PingResult directly.
+
+  WHEN TO USE IT:
+    Call POST /api/v1/scanner/ping when you only want to check if a host
+    is alive. Much faster than a full scan (5s max vs ~2 min).
+    Body: { "target": "192.168.1.10" }
+
+  ──────────────────────────────────────────────────────────────────────────────
+
+  ScannerService.testConnection(target, method, credentials)
+  ────────────────────────────────────────────────────────────
+  WHERE USED : ScannerController.testConnection() → POST /api/v1/scanner/test-connection
+  SIGNATURE  : testConnection(target, method, credentials): Promise<ConnectionTestResult>
+
+  HOW IT WORKS:
+    Gets the method handler via getMethod(method).
+    Calls handler.testConnection(target, credentials).
+    Logs debug info with duration.
+    Returns { success, target, method, error? }.
+
+  WHEN TO USE IT:
+    Call before attempting a full scan to validate that credentials and
+    network access are correct. Useful for a "Test Connection" button in UI.
+    Body: { "target": "192.168.1.10", "method": "powershell",
+            "credentials": { "username": "admin", "password": "...", "domain": "CORP" } }
+
+  ──────────────────────────────────────────────────────────────────────────────
+
+  ScannerService.fetchHardware(target, method, credentials)
+  ──────────────────────────────────────────────────────────
+  WHERE USED : ScannerController.fetchHardware() → POST /api/v1/scanner/hardware
+               ScannerService.fullScan() Step 3
+  SIGNATURE  : fetchHardware(target, method, credentials): Promise<HardwareInfo>
+
+  HOW IT WORKS:
+    Gets method handler, calls fetchHardwareInfo(), then normalizeHardware()
+    on the raw result. Returns canonical HardwareInfo object.
+
+  WHEN TO USE IT:
+    When you only need hardware info without software. Faster than fullScan
+    with skipSoftware=true because it skips ping and connection test too.
+    Body: { "target": "...", "method": "ssh", "credentials": {...} }
+
+  ──────────────────────────────────────────────────────────────────────────────
+
+  ScannerService.fetchSoftware(target, method, credentials)
+  ──────────────────────────────────────────────────────────
+  WHERE USED : ScannerController.fetchSoftware() → POST /api/v1/scanner/software
+               ScannerService.fullScan() Step 4
+  SIGNATURE  : fetchSoftware(target, method, credentials): Promise<SoftwareEntry[]>
+
+  HOW IT WORKS:
+    Gets method handler, calls fetchSoftwareInfo(), then normalizeSoftware()
+    on the result. Returns normalized software array.
+
+  WHEN TO USE IT:
+    When you only want the software list for a machine, not hardware.
+    Body: { "target": "...", "method": "powershell", "credentials": {...} }
+
+  ──────────────────────────────────────────────────────────────────────────────
+
+  ScannerService.fullScan(options)
+  ─────────────────────────────────
+  WHERE USED : ScannerController.fullScan() → POST /api/v1/scanner/scan
+  SIGNATURE  : fullScan(options: FullScanOptions): Promise<ScanResult>
+  OPTIONS:
+    target          : IP or hostname to scan
+    method          : powershell | wmi | ssh | node-wmi
+    credentials     : { username, password, domain? }
+    skipPing        : boolean (default false) — skip ICMP check
+    skipSoftware    : boolean (default false) — skip software inventory
+    continueOnError : boolean (default true)  — proceed even if a step fails
+
+  HOW IT WORKS:
+    Orchestrates 4 steps in sequence:
+
+    Step 1 — Ping
+      Calls pingHost(target). If host is dead and continueOnError=false,
+      throws PING_FAILED (503). If skipPing=true, treats pingSuccess as true.
+
+    Step 2 — Test Connection
+      Calls getMethod(method).testConnection(). If it fails and
+      continueOnError=false, throws CONNECTION_FAILED (503).
+      If connectionSuccess=false, ALWAYS stops here (hardware and software
+      cannot be fetched without a connection, regardless of continueOnError).
+
+    Step 3 — Hardware Info
+      Calls this.fetchHardware(). On failure, records the error and
+      continues (if continueOnError=true).
+
+    Step 4 — Software Info
+      Calls this.fetchSoftware(). Skipped entirely if skipSoftware=true.
+      On failure, records the error and continues.
+
+    Returns ScanResult:
+      { target, method, pingSuccess, connectionSuccess,
+        hardware?, software?, errors: {}, startedAt, completedAt }
+    errors is a map of step-name → error message for any step that failed.
+    The HTTP response is still 200 even with partial failures.
+
+  WHEN TO USE IT:
+    This is the main endpoint for a complete device scan.
+    POST /api/v1/scanner/scan
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/scanner.controller.ts  (class ScannerController)
+────────────────────────────────────────────────────────────────────────────────
+
+  getMeta(res)  [private helper]
+  ──────────────────────────────
+  Extracts requestId and startTime from res.locals (set by logging middleware)
+  and calls buildMeta() to produce the ApiMeta object for responses.
+
+  getMethods(_req, res)
+  ──────────────────────
+  WHERE USED : GET /api/v1/scanner/methods
+  HOW IT WORKS: Calls getAvailableMethods() and returns its result wrapped
+    in successResponse(). No async work — synchronous response.
+
+  ping(req, res, next)
+  ─────────────────────
+  WHERE USED : POST /api/v1/scanner/ping
+  HOW IT WORKS: Extracts target from req.body, calls service.ping(target),
+    responds with successResponse({ alive, target, latencyMs }, "Ping completed").
+
+  testConnection(req, res, next)
+  ───────────────────────────────
+  WHERE USED : POST /api/v1/scanner/test-connection
+  HOW IT WORKS: Extracts target, method, credentials from body.
+    Calls service.testConnection(). Responds with connection result.
+
+  fetchHardware(req, res, next)
+  ──────────────────────────────
+  WHERE USED : POST /api/v1/scanner/hardware
+  HOW IT WORKS: Extracts target, method, credentials. Calls service.fetchHardware().
+    Responds with the HardwareInfo object.
+
+  fetchSoftware(req, res, next)
+  ──────────────────────────────
+  WHERE USED : POST /api/v1/scanner/software
+  HOW IT WORKS: Extracts target, method, credentials. Calls service.fetchSoftware().
+    Responds with { hostname, count: N, software: [...] }.
+
+  fullScan(req, res, next)
+  ─────────────────────────
+  WHERE USED : POST /api/v1/scanner/scan
+  HOW IT WORKS: Extracts all fullScan options from body. Calls service.fullScan().
+    If any step had errors, message says "Scan completed with some errors",
+    otherwise "Scan completed successfully". Always HTTP 200 on partial results.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  FILE: src/modules/scanner/scanner.validation.ts
+────────────────────────────────────────────────────────────────────────────────
+
+  validate<T>(schema)  [Express middleware factory]
+  ───────────────────────────────────────────────────
+  WHERE USED : scanner.routes.ts — before every controller handler
+  SIGNATURE  : validate(schema: ZodSchema<T>): Express middleware
+
+  HOW IT WORKS:
+    Returns an Express middleware function. When the request arrives:
+      1. Calls schema.safeParse(req.body).
+      2. If validation fails → throws AppError(400, VALIDATION_ERROR)
+         with Zod's flattened error issues in the details field.
+      3. If validation succeeds → replaces req.body with the parsed
+         (and type-coerced) result, calls next().
+    By replacing req.body, the controller always receives a correctly-typed
+    and defaults-filled object (e.g., continueOnError=true is filled in
+    even if the client didn't send it).
+
+  Schemas defined:
+    pingSchema            : { target: IPv4 or hostname }
+    testConnectionSchema  : { target, method, credentials }
+    hardwareSchema        : { target, method, credentials }
+    softwareSchema        : { target, method, credentials }
+    fullScanSchema        : { target, method, credentials, skipPing=false,
+                              skipSoftware=false, continueOnError=true }
+
+  targetSchema rules:
+    - Required, non-empty, max 253 chars
+    - Must match: valid IPv4 (1-3 digit octets) OR valid hostname
+      (alphanumeric + hyphens, dot-separated labels)
+
+  credentialsSchema rules:
+    - username: required, non-empty string
+    - password: required, non-empty string
+    - domain:   optional string
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  SECTION 4 — HOW TO SCALE: HANDLING 10,000 IPs AT THE SAME TIME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+THE PROBLEM WITH THE CURRENT DESIGN
+─────────────────────────────────────
+Right now, every POST /scan blocks an HTTP connection until the scan completes
+(up to 2 minutes). If 10,000 IPs are sent at once, you will have 10,000 open
+HTTP connections. At 60 child processes per second (conservative), it would
+take 2-3 hours to finish — and many client connections will time out.
+
+THE SOLUTION: JOB QUEUE + WORKER POOL
+───────────────────────────────────────
+The architecture to handle 10,000+ IPs is a 3-tier system:
+
+  TIER 1: API SERVER (thin, fast)
+    Receives the bulk request, creates job records, returns job IDs.
+    Never does the actual scanning.
+
+  TIER 2: REDIS + BULLMQ QUEUE
+    Stores pending scan jobs. Acts as a buffer between the API and workers.
+    Survives server restarts. Supports automatic retries.
+
+  TIER 3: WORKER POOL (does the actual scanning)
+    Multiple worker processes, each pulling from the queue.
+    Controlled concurrency — e.g., 50 scans per worker × 10 workers = 500
+    concurrent scans at a time, not 10,000 all at once.
+
+
+STEP-BY-STEP IMPLEMENTATION PLAN
+──────────────────────────────────
+
+Step 1 — Add a "Bulk Scan" endpoint to the API
+
+  POST /api/v1/scanner/bulk-scan
+  Body:
+  {
+    "targets": ["192.168.1.1", "192.168.1.2", ..., "192.168.1.10000"],
+    "method": "powershell",
+    "credentials": { "username": "admin", "password": "..." },
+    "skipSoftware": false
+  }
+
+  Response (immediate, does NOT wait for scans):
+  {
+    "jobBatchId": "batch-abc123",
+    "totalJobs": 10000,
+    "statusUrl": "/api/v1/scanner/batch/batch-abc123/status"
+  }
+
+  The endpoint does:
+    - Validates all targets (Zod, same rules as existing validation)
+    - Creates one BullMQ job per target in the Redis queue
+    - Records the batch in a database (batch ID → list of job IDs + statuses)
+    - Returns immediately with the batch ID
+
+Step 2 — Add a status polling endpoint
+
+  GET /api/v1/scanner/batch/:batchId/status
+  Response:
+  {
+    "batchId": "batch-abc123",
+    "total": 10000,
+    "completed": 3421,
+    "failed": 12,
+    "pending": 6567,
+    "results": [...]   // paginated, or stream as NDJSON
+  }
+
+  GET /api/v1/scanner/batch/:batchId/results?page=1&limit=100
+  Returns the actual scan results for completed jobs.
+
+Step 3 — Set up Redis
+
+  Install Redis (or use AWS ElastiCache / Azure Cache for Redis).
+  Redis is the queue backbone — it persists jobs, tracks which worker
+  has each job, and handles retries on failure.
+
+  docker run -d -p 6379:6379 redis:7-alpine
+
+Step 4 — Add the BullMQ worker process
+
+  Create: src/workers/scan.worker.ts
+
+  import { Worker } from 'bullmq';
+  import IORedis from 'ioredis';
+  import { ScannerService } from '../modules/scanner/scanner.service';
+
+  const connection = new IORedis({ host: 'redis', port: 6379 });
+  const service = new ScannerService();
+
+  const worker = new Worker('scan-jobs', async (job) => {
+    const { target, method, credentials, skipPing, skipSoftware } = job.data;
+    return await service.fullScan({
+      target, method, credentials,
+      skipPing: skipPing ?? false,
+      skipSoftware: skipSoftware ?? false,
+      continueOnError: true,
+    });
+  }, {
+    connection,
+    concurrency: 50,   // this worker handles 50 scans simultaneously
+  });
+
+  The `concurrency: 50` is the key setting. Each worker process pulls up to
+  50 jobs from the queue and runs them in parallel using Node's async/await.
+
+Step 5 — Run multiple worker processes
+
+  Scale the number of worker processes based on your server resources:
+    - Each concurrent scan spawns 1-3 child processes (ping + powershell/ssh).
+    - A server with 16 CPU cores can handle ~50-100 concurrent child processes.
+    - concurrency=50 per worker × 2 workers per server × N servers = total throughput.
+
+  With PM2 (single server, multiple cores):
+    pm2 start dist/workers/scan.worker.js -i 4   # 4 worker processes
+    pm2 start dist/server.js -i 2               # 2 API server processes
+
+  With Docker Compose (multi-server):
+    services:
+      api:
+        image: net-scan-backend
+        command: node dist/server.js
+        replicas: 2
+      worker:
+        image: net-scan-backend
+        command: node dist/workers/scan.worker.js
+        replicas: 10    # 10 workers × 50 concurrency = 500 parallel scans
+      redis:
+        image: redis:7-alpine
+
+Step 6 — Add a database for batch tracking
+
+  Install Postgres or MongoDB to store:
+    - Batch records (batchId, created_at, total count, status)
+    - Job results (jobId, batchId, target, status, result JSON, error)
+
+  Without a database, results are lost if the worker or API restarts.
+  BullMQ can store completed job results in Redis, but Redis is not
+  ideal for large result sets (hardware+software JSON per machine can
+  be 50-100KB × 10,000 = ~500MB to 1GB).
+
+  Recommendation: Store results in Postgres (JSONB column for flexibility),
+  keep only job IDs and statuses in Redis.
+
+
+CONCURRENCY MATH FOR 10,000 IPs
+─────────────────────────────────
+  Assumptions:
+    - Average scan time: 90 seconds per IP (ping + connect + hw + sw)
+    - 500 concurrent scans (10 workers × 50 concurrency)
+    - No network bottleneck on the scan server
+
+  Time to complete 10,000 IPs:
+    10,000 / 500 = 20 batches of 500
+    20 × 90s = 1,800 seconds = 30 minutes
+
+  If you need faster (e.g., 10 minutes):
+    Need 1,000 concurrent scans → 20 workers × 50 concurrency
+    Or 10 workers × 100 concurrency (depends on server CPU/FD limits)
+
+
+RESOURCE LIMITS TO WATCH
+─────────────────────────
+  File Descriptors (most important):
+    Each scan opens: 1 child process (2 pipes) + 1 TCP socket + 1 temp file.
+    That's ~4 FDs per scan. At 500 concurrent: 2,000 FDs.
+    Default Linux limit: 1,024 per process. Increase it:
+      ulimit -n 65535                     (shell)
+      LimitNOFILE=65535 in systemd unit   (service)
+
+  RAM:
+    Each child process (powershell.exe) uses ~30-50MB.
+    At 500 concurrent: up to 25GB just for PowerShell processes.
+    Keep concurrency lower if RAM is limited. Use SSH method (lower RAM).
+
+  Network:
+    10,000 concurrent WinRM sessions from one IP may trigger firewall
+    rate limits on the target network. Consider throttling to 100-200
+    concurrent scans per source IP.
+
+
+QUICK SUMMARY TABLE
+─────────────────────
+  Target      What to add
+  ──────────  ──────────────────────────────────────────────────────────
+  10 IPs      Current design works fine. Just call /scan 10 times.
+  100 IPs     Current design works. Node.js handles parallel requests.
+  1,000 IPs   Add BullMQ + Redis. 2 workers, concurrency=50.
+  10,000 IPs  BullMQ + Redis + 10 workers + Postgres for results + poll endpoint.
+  100,000 IPs Same as above + horizontal pod autoscaling on worker deployment.
+
+
+================================================================================
+  END OF DOCUMENTATION
+================================================================================

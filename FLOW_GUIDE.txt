@@ -1,0 +1,737 @@
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 1 — THE BIG PICTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Think of this backend as a remote inspector.
+
+You give it a target machine's IP address, tell it which "language" to use
+to talk to that machine (PowerShell, WMI, SSH, or Node-WMI), and hand it
+the login credentials. The backend then goes out to that machine, collects
+hardware and software inventory, and brings that data back to you in a clean,
+structured format.
+
+The entire journey looks like this:
+
+  Your Request
+       │
+       ▼
+  [ IP & Credential Validation ]     ← Is the input even valid?
+       │
+       ▼
+  [ Ping Check ]                     ← Is the machine alive on the network?
+       │
+       ▼
+  [ Connection Test ]                ← Can we log in with these credentials?
+       │
+       ▼
+  [ Hardware Data Fetch ]            ← Collect CPU, RAM, Disks, OS, etc.
+       │
+       ▼
+  [ Software Data Fetch ]            ← Collect installed applications
+       │
+       ▼
+  [ Normalize & Return ]             ← Clean up and send back a tidy result
+
+Each stage is a gate. If the machine is dead, we stop at ping. If credentials
+are wrong, we stop at connection test. If the machine is reachable and login
+works, we fetch everything and return it. This gate approach avoids wasting
+time on a 60-second PowerShell script against a machine that was already
+unreachable at the 5-second ping stage.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 2 — STAGE 1: IP AND CREDENTIAL VALIDATION
+  (Before any network call is made)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The very first thing that happens — before any network traffic — is pure
+input checking. The backend validates what you sent in the request body.
+
+WHAT IS CHECKED
+
+  Target (IP or Hostname)
+  ─────────────────────────
+  The system checks that the target is either a valid IPv4 address or a
+  properly formatted hostname. A valid IPv4 means four groups of digits
+  separated by dots (e.g., 192.168.1.10). A valid hostname means alphanumeric
+  labels separated by dots with no invalid characters (e.g., server01.corp.local).
+  The target cannot be empty and cannot be longer than 253 characters (the DNS
+  maximum). If any of this fails, the request is rejected immediately with a
+  "400 Bad Request" response — no network call is ever made.
+
+  Scan Method
+  ────────────
+  You must specify which method to use: powershell, wmi, ssh, or node-wmi.
+  Any other value is rejected immediately. This also triggers platform checking
+  — wmi and node-wmi only work when the backend is running on Windows. If the
+  backend is on Linux and you request wmi, you get a clear error before any
+  connection attempt.
+
+  Credentials
+  ────────────
+  Username and password must both be present and non-empty. The domain field
+  is optional (used for Active Directory environments where the username alone
+  is not enough, e.g., CORP\adminuser). There is no complexity check on the
+  password — that is the responsibility of the target machine.
+
+  Scan Flags
+  ───────────
+  The full scan accepts three optional boolean flags:
+    - Skip Ping: skip the ICMP check and assume the host is alive
+    - Skip Software: only collect hardware, not installed apps
+    - Continue On Error: if one step fails, keep going instead of stopping
+
+  If you don't send these flags, the defaults are safe: ping is run, software
+  is collected, and errors in one step don't stop the rest.
+
+WHY THIS MATTERS
+
+  Validation happens in less than 1 millisecond — it is pure logic, no I/O.
+  If 10,000 requests come in and 500 have invalid IPs, those 500 are turned
+  away instantly without ever touching the network or consuming a worker slot.
+  This is the cheapest gate in the entire pipeline.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 3 — STAGE 2: PING CHECK
+  (Is the machine even turned on and reachable?)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Once the input is valid, the backend sends a single ICMP ping to the target.
+ICMP ping is the most basic network check — it asks "are you there?" and
+waits for "yes, I'm here." The entire ping takes at most 5 seconds.
+
+HOW THE PING WORKS
+
+  The backend uses the operating system's own ping command (not a library),
+  which means the behavior is native and reliable. It sends exactly one packet
+  and waits for a reply. If a reply comes back within 5 seconds, the machine
+  is considered alive. The reply also tells us the round-trip latency in
+  milliseconds, which is included in the result.
+
+  On Windows, there is a known quirk: ping.exe returns a success exit code
+  even when the host is unreachable or the request timed out. So the system
+  does not just check whether ping "succeeded" — it also reads the output
+  text and looks for phrases like "Request timed out" or "Destination host
+  unreachable." If those phrases appear, the host is declared dead even if
+  the exit code was 0.
+
+WHAT HAPPENS AFTER PING
+
+  Machine responded to ping → continue to credential check
+  Machine did not respond  → stop here (machine is offline or blocking ICMP)
+
+  Exception: if you set "Skip Ping = true" in the request, the ping stage
+  is bypassed entirely and the backend assumes the host is alive. This is
+  useful for machines that have ICMP blocked by firewall but are otherwise
+  reachable via WinRM or SSH.
+
+  The ping result (alive: true/false, latency in ms) is always included in
+  the final response even if the overall scan continues past it.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 4 — STAGE 3: CONNECTION TEST
+  (Can we log in with these credentials?)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After confirming the machine is alive, the backend checks whether the chosen
+method can actually connect and authenticate. This stage is different for each
+of the four scan methods.
+
+SELF-SCAN DETECTION (all methods)
+
+  Before any network call, the system checks whether the target IP belongs
+  to the machine running the backend itself. This is called a "local target"
+  check. If you scan your own server, Windows has a security restriction
+  that blocks remote authentication to yourself — even with valid admin
+  credentials — due to a feature called UAC remote token filtering.
+
+  If the target is local, the connection test skips the network check and
+  reports success immediately. The subsequent hardware/software fetches
+  then use direct local queries instead of going over the network.
+
+CONNECTION TEST — POWERSHELL METHOD
+  Step 1: Open a raw TCP socket to port 5985 (WinRM HTTP) on the target.
+          If the port does not accept a connection within 3 seconds, WinRM
+          is not available and we report failure. No credentials are tried.
+  Step 2: If the port is open, run a tiny test script via PowerShell Remoting:
+          connect to the target using the provided credentials and ask it
+          to return its own hostname. If that succeeds, the connection is good.
+          If authentication fails, the error message tells us why (wrong password,
+          account locked, no admin rights, etc.).
+
+CONNECTION TEST — WMI METHOD
+  Step 1: TCP check on port 135 (the Windows RPC Endpoint Mapper).
+          Port 135 is the "front door" for DCOM — if it's closed, WMI
+          over DCOM cannot work at all.
+  Step 2: Run a minimal WMI query using VBScript over DCOM. Ask for just
+          the OS name from the target's WMI service. If it comes back,
+          credentials and DCOM access are confirmed.
+
+CONNECTION TEST — SSH METHOD
+  Step 1: TCP check on port 22.
+  Step 2: Open a full SSH session using the provided username and password.
+          The SSH library tries both standard password authentication and
+          keyboard-interactive authentication (Windows OpenSSH servers
+          commonly use keyboard-interactive). If the session opens and a
+          simple test command runs, the connection is good.
+
+CONNECTION TEST — NODE-WMI METHOD
+  Same as WMI: TCP check on 135 first, then a minimal WMI query using
+  the Node-WMI library (a native Node.js DCOM client, no child process).
+
+WHAT HAPPENS AFTER CONNECTION TEST
+
+  Connection succeeded → continue to hardware data fetch
+  Connection failed    → stop here, return the error (wrong credentials,
+                         port blocked, service not running, etc.)
+
+  This is the only stage that always stops on failure, even if
+  "Continue On Error" is set to true. There is no point fetching hardware
+  data if there is no working connection to fetch it through.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 5 — STAGE 4: HARDWARE DATA FETCH
+  (What is inside this machine?)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Once connected, the backend queries the target machine's hardware inventory.
+Each scan method does this differently, but all of them return the same data
+in the end. Here is what is collected and how each method gets it.
+
+DATA COLLECTED
+  - Hostname and domain membership
+  - Manufacturer and model (Dell, HP, Lenovo, VMware, etc.)
+  - Whether it is a virtual machine (hypervisor present)
+  - CPU name, number of sockets, cores per socket, logical processors,
+    clock speeds (max and current)
+  - Total RAM in GB
+  - Disk drives: device ID (C:, D:, /dev/sda) and size in GB
+  - Network adapters: name, MAC address, IP addresses
+  - Operating system: name, version, build number, architecture,
+    install date, manufacturer, registered user
+  - Windows directory and boot device
+  - Windows license: name, description, product key (partial)
+  - Graphics card name
+  - BIOS serial number
+  - Primary logged-in username
+  - Scan timestamp
+
+HOW EACH METHOD FETCHES HARDWARE
+
+  POWERSHELL METHOD
+  ─────────────────
+  This method writes a PowerShell script to a temporary file on the backend
+  server, then asks PowerShell to execute that script remotely against the
+  target machine via WinRM. The script uses Windows Management Instrumentation
+  (WMI) classes built into every Windows machine:
+    - Win32_ComputerSystem for machine identity and RAM
+    - Win32_OperatingSystem for OS details and license
+    - Win32_Processor for CPU details and core counts
+    - Win32_DiskDrive for physical disk sizes
+    - Win32_NetworkAdapterConfiguration for IP and MAC addresses
+    - Win32_VideoController for GPU name
+    - Win32_BIOS for serial number
+    - SoftwareLicensingProduct for Windows activation key
+  The script collects all this data on the target machine, converts it to JSON,
+  and sends it back over the WinRM connection. The backend receives the JSON,
+  parses it, and normalizes it.
+  Temp script file is deleted immediately after execution whether or not it
+  succeeded — no files are left behind.
+
+  WMI METHOD (VBScript over DCOM)
+  ────────────────────────────────
+  This method does the same thing as PowerShell but without PowerShell.
+  Instead, it writes a VBScript to a temp file and runs it via cscript.exe
+  (the Windows Script Host). The VBScript uses an older Windows technology
+  called DCOM to connect directly to the WMI service on the target machine.
+  It queries the same Win32 classes as PowerShell but through VBScript's
+  WbemScripting API. VBScript does not have a JSON library, so the script
+  builds the JSON string manually character by character.
+  Use this method when PowerShell Remoting is disabled on the target but
+  WMI/DCOM traffic is allowed through the firewall.
+
+  SSH METHOD
+  ──────────
+  This method connects over SSH and runs command-line tools that are already
+  on every Windows machine. No scripts are sent — only standard commands:
+    - `systeminfo` → produces a plain-text report of hostname, OS, RAM,
+      CPU, manufacturer, domain, boot device, and registered owner
+    - `ipconfig /all` → lists all network adapters with IPs and MACs
+    - `wmic diskdrive get Caption,Size` → lists physical disks and sizes
+    - `wmic path Win32_VideoController get Caption` → GPU name
+    - A short PowerShell command for license info (if PowerShell is available)
+  Each command runs sequentially over the same SSH connection. The backend
+  then parses each command's text output with dedicated parsers.
+  The systeminfo parser reads the "Field Name: Value" format line by line.
+  The ipconfig parser splits the output into adapter blocks and extracts
+  MACs and IPs from each. The disk parser reads the CSV output from wmic.
+  This method works on any machine with SSH enabled — no PowerShell Remoting,
+  no WMI firewall rules needed. Data coverage is slightly less than PowerShell
+  because systeminfo does not expose every field that WMI does.
+
+  NODE-WMI METHOD
+  ───────────────
+  This method uses a Node.js library that can speak DCOM natively without
+  spawning any child process or writing any temp files. The library holds
+  the credentials in Node.js memory and communicates with the target's WMI
+  service directly from the Node.js process. It queries the same Win32
+  classes as the other methods. This is the cleanest method from a process
+  isolation perspective but requires the backend to be running on Windows.
+
+NORMALIZATION (all methods)
+
+  After the raw data comes back, it goes through a normalization step
+  regardless of which method fetched it. This step is important because
+  different methods return field names in different formats:
+    PowerShell might return "TotalPhysicalMemoryGB"
+    WMI might return "TotalPhysicalMemory (GB)"
+    SSH systeminfo returns a number that needs to be converted from MB to GB
+  The normalizer knows all the possible names for each field and picks
+  the first one it finds. It also builds derived fields like:
+    - A comma-separated list of all MAC addresses
+    - A comma-separated list of all IP addresses
+    - A formatted disk summary ("C: (Total: 120 GB), D: (Total: 500 GB)")
+  The result is always the same shape regardless of which method was used,
+  so the frontend or export layer never has to know which method ran.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 6 — STAGE 5: SOFTWARE DATA FETCH
+  (What applications are installed on this machine?)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Software inventory runs after hardware. It is optional — you can skip it with
+the "Skip Software" flag to get a faster result when you only need hardware.
+
+DATA COLLECTED PER APPLICATION
+  - Application name
+  - Version number
+  - Publisher / vendor
+  - Install date
+  - Serial / product ID (if present in registry)
+  - Registry path where the entry was found
+
+HOW EACH METHOD FETCHES SOFTWARE
+
+  POWERSHELL METHOD
+  ─────────────────
+  Reads directly from the Windows registry uninstall keys — two of them:
+    - The 64-bit hive: for native 64-bit applications
+    - The 32-bit hive (WOW6432Node): for 32-bit applications installed on
+      a 64-bit system
+  This is the fastest and most complete way to list installed software on
+  Windows. Unlike the WMI Win32_Product class, reading registry keys does
+  not trigger any Windows Installer repair operations. Applications that were
+  installed silently or via group policy also appear here, not just MSI packages.
+  Duplicates (apps that appear in both hives) are removed before returning.
+
+  WMI METHOD & NODE-WMI METHOD
+  ─────────────────────────────
+  Uses the Win32_Product WMI class over DCOM. This class only shows MSI-packaged
+  applications. It is slower than the registry approach because Windows Installer
+  runs a consistency check on every installed MSI package during the query.
+  On a machine with 200+ applications, this can take 30-60 seconds.
+  These methods will return fewer results than PowerShell for the same machine
+  because non-MSI software (portable apps, some system tools) is not tracked
+  by Win32_Product.
+
+  SSH METHOD
+  ──────────
+  Reads the registry remotely using the `reg query` command over SSH.
+  Queries the same two uninstall hive paths as the PowerShell method.
+  The output is plain text in the format "ValueName    REG_SZ    ValueData"
+  for each registry value. The backend parses this text line by line.
+  Results from both hives are merged and deduplicated.
+  Same coverage as PowerShell since both read from the same registry source.
+
+NORMALIZATION
+
+  Each software entry gets the same treatment as hardware: field name
+  aliasing (ApplicationName vs Application_Name), and the addition of:
+    - Hostname: which machine this entry came from
+    - Status: "OK"
+    - Remark: "Successful"
+    - Last_Scan_Time: formatted timestamp of when the scan ran
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 7 — CREDENTIAL SECURITY FLOW
+  (How credentials are handled safely throughout)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Credentials (username and password) need to reach the target machine but
+must never leak into logs, process lists, or error messages. Here is how
+that is achieved at each step.
+
+IN TRANSIT TO THE BACKEND
+  The request should go over HTTPS (TLS). The backend itself does not enforce
+  this — that is handled by the reverse proxy (nginx, load balancer) in front
+  of it. Over HTTPS, the request body (including credentials) is encrypted.
+
+INSIDE THE BACKEND — POWERSHELL AND WMI METHODS
+  The password is placed inside the script body, not in the command arguments
+  used to start the script. The difference matters: on Windows, anyone can
+  run Task Manager or `wmic process` and see the full command line of every
+  running process. If the password were in the arguments, it would be visible
+  there. By putting it in the script file body, it is not visible in the
+  process list.
+  The temp script file is written to the OS temp directory with a random UUID
+  filename (e.g., ns-f3a8b2c1-....ps1). It is deleted immediately after
+  execution finishes — whether the script succeeded or failed. There is no
+  window where an old script file sits around.
+
+INSIDE THE BACKEND — SSH METHOD
+  The ssh2 library holds the password in Node.js process memory. It is sent
+  to the target only during the SSH handshake over the encrypted SSH channel.
+  It is never written to a file.
+
+IN LOGS
+  The Winston logger has a scrubber that removes any key named "password"
+  from log output before it is written to disk. Even if a bug caused the
+  credentials to be passed into a logging call, the password value would
+  be stripped. Log files only ever contain "[REDACTED]" where a password
+  field would appear.
+
+IN ERROR MESSAGES
+  Error objects that are sent back to the client do not include the credential
+  details. Error details (like the first 500 characters of stderr from a failed
+  script) are logged server-side but not returned in the HTTP response body.
+
+SUMMARY FLOW
+
+  Client sends credentials (HTTPS)
+       ↓
+  Credentials received in memory
+       ↓
+  Written into temp script file body (PS/WMI) or held in memory (SSH)
+       ↓
+  Script executed, credentials sent to target over WinRM/DCOM/SSH
+       ↓
+  Temp file deleted immediately
+       ↓
+  Password field stripped from any log entry
+       ↓
+  Error responses never include the password value
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 8 — HOW THE FOUR METHODS COMPARE
+  (When to choose which one)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+                  PowerShell    WMI (DCOM)    SSH         Node-WMI
+                  ──────────    ──────────    ───         ────────
+  Port required   5985/5986     135 + high    22          135 + high
+  PS on target    Yes           No            No          No
+  PS on server    Yes (or pwsh) No            No          No
+  Works on Linux  Yes (pwsh)    No            Yes         No
+  Script quality  Best          Good          Good        Good
+  Software speed  Fast          Slow*         Fast        Slow*
+  Data coverage   Best          Good          Good        Good
+  Process spawned powershell    cscript.exe   none        none
+
+  * WMI and Node-WMI use Win32_Product which triggers MSI repair scans,
+    making software fetch significantly slower than registry-based methods.
+
+  RECOMMENDATION ORDER:
+  1. PowerShell  — use this when target has WinRM enabled. Most complete data.
+  2. SSH         — use when WinRM is blocked but SSH is open. Nearly as good.
+  3. WMI         — use when only DCOM is available, not PowerShell Remoting.
+  4. Node-WMI    — use when you want no child processes (pure Node.js),
+                   and software list completeness is not critical.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 9 — HOW TO HANDLE THOUSANDS OF IPs AT THE SAME TIME
+  (Load balancing, job queuing, and scaling the worker pool)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+  THE PROBLEM WITH SCANNING ONE IP AT A TIME (CURRENT MODEL)
+────────────────────────────────────────────────────────────────────────────────
+
+When a client calls POST /scan, the backend does all five stages (validate,
+ping, connect, hardware, software) synchronously. The HTTP connection stays
+open the whole time. A full scan can take 30 seconds to 2 minutes depending
+on the method and the machine. This is fine for one or ten machines. But if
+a client sends 10,000 requests at once:
+
+  - 10,000 HTTP connections are held open for up to 2 minutes each
+  - The server tries to run 10,000 PowerShell processes simultaneously
+  - The server runs out of file descriptors, RAM, and CPU within seconds
+  - Most requests time out with no result
+
+The fundamental problem is that the current design ties the result delivery
+to the HTTP connection. The client has to wait the full duration. That model
+does not scale to large batches.
+
+────────────────────────────────────────────────────────────────────────────────
+  THE SOLUTION: DECOUPLE REQUEST FROM EXECUTION
+────────────────────────────────────────────────────────────────────────────────
+
+The pattern used by every large-scale job processing system is:
+
+  1. Accept the request instantly, return a job ID
+  2. Put the actual work in a queue
+  3. Have workers pull from the queue and do the work at a controlled rate
+  4. Let the client check back for results when it's ready
+
+This means the HTTP connection is only open for milliseconds (just long
+enough to accept the input and hand back a job ID). The actual scanning
+happens in the background, independently of the HTTP connection.
+
+────────────────────────────────────────────────────────────────────────────────
+  THE THREE-TIER ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌──────────────────────────────────────────────────────────────┐
+  │  TIER 1: API SERVERS (thin, fast, stateless)                 │
+  │                                                              │
+  │  Accepts the bulk request with a list of IPs.               │
+  │  Validates each IP and the credentials.                      │
+  │  Creates one job per IP in the queue.                        │
+  │  Returns a batch ID instantly (in under 1 second).          │
+  │  Also serves the "check status" and "get results" endpoints. │
+  │  Can run many instances behind a load balancer.              │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │ puts jobs in
+                             ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  TIER 2: REDIS QUEUE (the job buffer)                        │
+  │                                                              │
+  │  Holds every pending scan job.                               │
+  │  Each job contains: target IP, method, credentials, options. │
+  │  Jobs persist in Redis even if servers restart.              │
+  │  Workers claim jobs from here — each job is only            │
+  │  processed by one worker at a time (no duplicates).          │
+  │  Failed jobs can be automatically retried.                   │
+  └──────────────────────────┬───────────────────────────────────┘
+                             │ workers pull from
+                             ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  TIER 3: WORKER SERVERS (do the actual scanning)             │
+  │                                                              │
+  │  Each worker server runs N scan jobs concurrently.          │
+  │  N is controlled (e.g., 50 jobs at a time per worker).      │
+  │  Workers are stateless — they just pull, scan, store result. │
+  │  You can add more worker servers to increase throughput.     │
+  │  Results are stored in the database (not sent over HTTP).    │
+  └──────────────────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+  THE FLOW FOR A BULK SCAN
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 1 — CLIENT SENDS A BULK REQUEST (instant return)
+
+  The client sends one request with a list of all 10,000 IPs plus the
+  method and credentials to use for all of them.
+
+  The API server:
+    → Validates the credentials (one check, shared for all IPs)
+    → Validates each IP address (fast, no network)
+    → Creates 10,000 job entries in the Redis queue
+    → Creates a "batch" record in the database linking all job IDs
+    → Responds immediately: "Here is your batch ID, check back for results"
+
+  Total time for this step: under 2 seconds for 10,000 IPs.
+
+STEP 2 — WORKERS PROCESS THE QUEUE (background)
+
+  Workers are always running. As soon as jobs appear in the queue, workers
+  start pulling them.
+
+  Each worker has a concurrency limit. A worker with concurrency = 50 means
+  it runs 50 scans at the same time. Since each scan is mostly waiting
+  (waiting for ping response, waiting for PowerShell to finish), Node.js
+  can handle many concurrent scans without blocking.
+
+  For each job, the worker runs the same 5-stage pipeline as before:
+    Validate → Ping → Connect → Hardware → Software
+  When the scan finishes (success or partial failure), the result is
+  written to the database under that job's ID.
+
+STEP 3 — CLIENT POLLS FOR RESULTS (at its own pace)
+
+  The client can check progress at any time:
+    "How many of my 10,000 jobs are done?"
+    → The database has the count: 3,421 complete, 12 failed, 6,567 pending
+
+  Once complete (or even while in progress), the client fetches results
+  in pages: "Give me jobs 1-100, then 101-200, etc."
+    → Each page returns the scan results for that batch of machines
+
+  This way the client never has to hold a long-running connection open.
+  It fires the request, does other work, and checks back.
+
+────────────────────────────────────────────────────────────────────────────────
+  HOW CONCURRENCY CONTROL WORKS (the most important concept)
+────────────────────────────────────────────────────────────────────────────────
+
+Without control, 10,000 scans would all start at once. With control, you
+process them at a sustainable rate that does not crash the server or
+overwhelm the target network.
+
+The concurrency limit is set per worker. Think of it like a worker who can
+only hold 50 files at a time. When they finish one, they pick up the next
+from the queue. The queue never runs out of work to give them.
+
+  10 workers × 50 concurrent scans each = 500 scans running at any moment
+
+If the average scan takes 90 seconds:
+  500 scans complete every 90 seconds = ~5-6 scans per second throughput
+  10,000 ÷ 500 = 20 rounds × 90 seconds = 30 minutes total for 10,000 IPs
+
+If you need it faster, add more workers (more servers). The queue is the
+shared pool — workers from any server can pull from it. This is how you
+scale horizontally.
+
+────────────────────────────────────────────────────────────────────────────────
+  LOAD BALANCING THE API SERVERS
+────────────────────────────────────────────────────────────────────────────────
+
+The API tier (thin layer that accepts requests and serves results) is
+already stateless — it does not store anything in memory between requests.
+This means you can run multiple API servers behind a load balancer with no
+special configuration.
+
+  Client Request
+       │
+       ▼
+  [ Load Balancer ]   ← nginx, AWS ALB, or any reverse proxy
+       │
+       ├── API Server 1  → pushes to Redis queue
+       ├── API Server 2  → pushes to Redis queue
+       └── API Server 3  → pushes to Redis queue
+                ↕ (all three read from the same Redis and same database)
+
+Any API server can handle any request because they all share the same
+Redis queue and the same result database. The load balancer distributes
+requests evenly. If one API server goes down, the others continue working.
+
+────────────────────────────────────────────────────────────────────────────────
+  LOAD BALANCING THE WORKER SERVERS
+────────────────────────────────────────────────────────────────────────────────
+
+Workers are also stateless (they pull work, do it, write result, repeat).
+Adding more workers automatically distributes the load:
+
+  Redis Queue (10,000 jobs waiting)
+       │
+       ├── Worker Server A (50 concurrent) — pulls jobs, scans, stores results
+       ├── Worker Server B (50 concurrent) — pulls jobs, scans, stores results
+       ├── Worker Server C (50 concurrent) — pulls jobs, scans, stores results
+       └── Worker Server D (50 concurrent) — pulls jobs, scans, stores results
+
+There is no explicit load balancer between workers — Redis acts as the
+natural distributor. Each worker atomically claims a job when it pulls it,
+so the same job is never processed by two workers.
+
+If a worker crashes mid-scan, Redis detects that the job was not acknowledged
+and puts it back in the queue after a timeout. Another worker picks it up.
+This gives automatic retry and fault tolerance.
+
+────────────────────────────────────────────────────────────────────────────────
+  HOW TO SCALE FOR DIFFERENT BATCH SIZES
+────────────────────────────────────────────────────────────────────────────────
+
+  Up to 100 IPs:
+    Current single-server design handles this without any queue.
+    Node.js async runs all 100 scans concurrently without queuing.
+    Done in 2-3 minutes. No changes needed.
+
+  100 to 1,000 IPs:
+    Add Redis + BullMQ queue. One worker server with concurrency = 50.
+    Results written to a lightweight database (even SQLite works here).
+    Done in 15-30 minutes. Client polls for results.
+
+  1,000 to 10,000 IPs:
+    Redis queue + 10 worker servers with concurrency = 50 each.
+    500 parallel scans. Postgres for results storage (handles JSONB well).
+    Done in 30 minutes. Client uses paginated result endpoint.
+
+  10,000 to 100,000 IPs:
+    Same as above but add auto-scaling on the worker deployment.
+    The load on worker servers is CPU and file-descriptor bound (from child
+    processes). Auto-scale based on: queue depth > 1,000 jobs = add workers.
+    Network rate limiting may be needed (max N concurrent connections to
+    any single target subnet to avoid triggering intrusion detection).
+
+────────────────────────────────────────────────────────────────────────────────
+  WHAT CAN GO WRONG AT SCALE AND HOW TO HANDLE IT
+────────────────────────────────────────────────────────────────────────────────
+
+  Too many child processes at once (PowerShell)
+    Each concurrent PowerShell scan spawns a powershell.exe process using
+    30-80MB of RAM. At 500 concurrent, that is 15-40GB RAM just for child
+    processes. Solution: use SSH method at scale (no child processes per scan),
+    or keep per-worker concurrency lower (20-30 instead of 50) and add more
+    worker servers.
+
+  File descriptor limits
+    Each scan opens file descriptors for the child process pipes and TCP sockets.
+    Default Linux systems allow 1,024 open files per process. At 50 concurrent,
+    you hit this quickly. Solution: raise the OS limit to 65,535 before starting
+    workers. This is a one-line configuration change in the system settings.
+
+  Target network rate limiting
+    Scanning 500 machines at once from one IP address may trigger network
+    security appliances (IDS/IPS, firewall) to rate-limit or block the
+    scan server's IP. Solution: spread scans across time (lower concurrency),
+    or use multiple scan server IPs with the scans distributed across them.
+
+  Large result payloads
+    A software inventory for one machine can have 200+ applications. Each
+    entry has 8 fields. At 10,000 machines, this is millions of records.
+    Do not try to return all results in a single API response. Always paginate.
+    Store results in Postgres with indexing on batchId and status.
+
+  Workers timing out on slow machines
+    Some machines take longer than the configured timeout to respond. The timeout
+    kills the scan and marks it as failed. Solution: allow retry (BullMQ supports
+    automatic retry with configurable attempts), or allow longer timeouts for
+    specific networks that are known to be slow.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 10 — END-TO-END FLOW SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SINGLE IP SCAN (current design, works today)
+
+  Client sends target + method + credentials
+       ↓
+  Backend validates: IP format, method name, username/password present
+       ↓
+  Backend pings the IP: alive or dead?
+       ↓ (dead → stop, return ping failure)
+  Backend tests connection: port open? credentials valid?
+       ↓ (failed → stop, return connection error)
+  Backend fetches hardware: run script/commands, collect WMI/systeminfo data
+       ↓ (failed → log error, continue or stop based on continueOnError flag)
+  Backend fetches software: registry query or Win32_Product
+       ↓ (failed → log error, continue or stop based on continueOnError flag)
+  Backend normalizes all data: unify field names, add timestamps, add aliases
+       ↓
+  Client receives: { ping result, connection result, hardware, software, errors }
+  Total time: 30 seconds (SSH, hardware only) to 2 minutes (PowerShell, full)
+
+BULK SCAN (10,000+ IPs, queue-based design)
+
+  Client sends list of IPs + method + credentials
+       ↓
+  API server validates all inputs, creates jobs in Redis queue
+  Returns batch ID immediately (under 1 second)
+       ↓
+  Workers pull jobs from Redis queue (50 at a time per worker)
+       ↓
+  Each worker runs the same 5-stage pipeline as single-IP scan
+       ↓
+  Results written to database as each job completes
+       ↓
+  Client polls: "How many done?" → "3,421/10,000 complete"
+  Client fetches: "Give me results 1-100" → paginated hardware + software data
+  Total time: 30 minutes for 10,000 IPs with 10 workers

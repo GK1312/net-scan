@@ -1,0 +1,1164 @@
+================================================================================
+  NET-SCAN  —  FRONTEND ARCHITECTURE & BACKEND INTEGRATION GUIDE
+================================================================================
+  Technology: Angular 21 + Electron + Angular Material
+  Target: Desktop Application (Windows)
+  Backend: net-scan-backend REST API (localhost:3000 or remote)
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 1 — HOW THE APPLICATION IS STRUCTURED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is a desktop application, not a website. It runs as a native Windows app
+using Electron. Inside Electron, an Angular web app is loaded in a browser
+window. A small local Express server (bundled with the app) acts as a bridge
+between the Angular frontend and the outside world.
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  ELECTRON SHELL (native OS window)                                   │
+  │                                                                      │
+  │  ┌────────────────────────────────────────────────────────────────┐  │
+  │  │  ANGULAR 21 APP  (rendered inside Electron BrowserWindow)     │  │
+  │  │                                                                │  │
+  │  │  Components → Services → HttpClient → backend API             │  │
+  │  └────────────────────────────────────────────────────────────────┘  │
+  │                                                                      │
+  │  ┌────────────────────────────────────────────────────────────────┐  │
+  │  │  LOCAL EXPRESS SERVER  (localhost:3000)                        │  │
+  │  │  Bundled with the app, starts in background when app opens.   │  │
+  │  │  Currently has only a /api/health endpoint.                   │  │
+  │  │  Will proxy or host scan-related local logic in future.       │  │
+  │  └────────────────────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────────────────┘
+            │ HTTP calls
+            ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  NET-SCAN-BACKEND  (separate Node.js service, can be remote)         │
+  │  Exposes: /api/v1/scanner/methods, ping, test-connection,            │
+  │           hardware, software, scan                                   │
+  └──────────────────────────────────────────────────────────────────────┘
+
+THREE PROCESSES RUN WHEN THE APP STARTS (dev mode):
+  1. ng serve     → Angular dev server on port 4200
+  2. tsx server/  → Local Express server on port 3000
+  3. electron .   → Electron window (waits for both servers to be ready first)
+
+In production (packaged .exe), Electron bundles the Angular build as static
+files and spawns the Express server as a Node.js child process internally.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 2 — ROUTING STRUCTURE (All Pages and Their Paths)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The router uses hash-based navigation (#/) so it works inside Electron's
+file:// URL without a server-side router.
+
+  /  (root)
+  └── redirects to /auth/sign-in
+
+  /auth                          Layout: AuthenticationLayout
+  ├── /auth/sign-in              Page: SignInPage
+  └── /auth/sign-up              Page: SignUpPage
+
+  /dashboard                     Layout: DashboardLayout  (sidebar + topbar)
+  ├── /dashboard/home            Page: HomePage
+  ├── /dashboard/assets          Page: AssetsPage
+  ├── /dashboard/reports         Page: ReportsPage
+  ├── /dashboard/software        Page: SoftwarePage
+  ├── /dashboard/scanning        Page: ScanningPage
+  └── /dashboard/configuration   Page: ConfigurationPage
+
+  /application
+  └── /application/error/404     Page: ErrorPage
+
+  ** (anything else)             redirects to /application/error/404
+
+All dashboard routes use lazy loading — the component code is only downloaded
+from the bundle when the user navigates to that route. This keeps initial
+load time fast.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 3 — LAYOUT COMPONENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Layouts are the shells that wrap pages. They provide consistent chrome
+(sidebars, headers, footers) without repeating it in every page.
+
+────────────────────────────────────────────────────────────────────────────────
+  AuthenticationLayout
+  File: src/app/layouts/authentication-layout/
+  Used by: /auth routes
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Provides the visual container for the login and signup pages.
+    Renders a centered card or split-screen layout (logo on left, form on right).
+    Uses Angular Material MatSidenavModule (imported).
+
+  WHAT IT RENDERS:
+    - App logo / branding
+    - A <router-outlet> where SignInPage or SignUpPage is injected
+    - No navigation sidebar (the user is not logged in yet)
+
+  BACKEND INTEGRATION:
+    None directly. The pages inside it (SignInPage) call the auth service.
+
+────────────────────────────────────────────────────────────────────────────────
+  DashboardLayout
+  File: src/app/layouts/dashboard-layout/
+  Used by: /dashboard/* routes
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    The main app shell after login. Wraps all dashboard pages with a
+    persistent navigation sidebar and top bar.
+
+  WHAT IT RENDERS:
+    - Left sidebar with navigation links to all 6 dashboard pages
+    - Top bar (app title, user info, logout button)
+    - A <router-outlet> where the active dashboard page is injected
+    - Possibly a notification/toast area
+
+  SIDEBAR NAVIGATION LINKS:
+    - Home          → /dashboard/home
+    - Assets        → /dashboard/assets
+    - Software      → /dashboard/software
+    - Reports       → /dashboard/reports
+    - Scanning      → /dashboard/scanning
+    - Configuration → /dashboard/configuration
+
+  BACKEND INTEGRATION:
+    Should call GET /api/v1/scanner/methods on layout initialization to
+    pre-load available scan methods and cache them for use in child pages.
+
+────────────────────────────────────────────────────────────────────────────────
+  EmptyLayout
+  File: src/app/layouts/empty-layout/
+  Used by: /application/* routes (error pages)
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    A bare layout with no sidebar or top bar. Used only for error pages
+    that should not look like part of the authenticated app.
+
+────────────────────────────────────────────────────────────────────────────────
+  PaymentLayout
+  File: src/app/layouts/payment-layout/
+  Used by: (reserved for future /payment/* routes)
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Reserved layout for any subscription or payment flow. No backend
+    integration currently defined.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 4 — AUTHENTICATION PAGES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+  SignInPage
+  Route: /auth/sign-in
+  File: src/app/pages/Authentication/sign-in-page/
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    The entry point to the application. User enters credentials to log in.
+    On success, navigate to /dashboard/home. On failure, show error toast.
+
+  COMPONENTS ON THIS PAGE:
+    - Email input field (Angular Material MatFormField + MatInput)
+    - Password input field with show/hide toggle
+    - "Sign In" button
+    - "Don't have an account? Sign Up" link → /auth/sign-up
+    - Error message display area
+
+  FORM FIELDS:
+    email    : required, must be valid email format
+    password : required, minimum 6 characters
+
+  BACKEND INTEGRATION:
+    Currently this app does not have its own auth backend — authentication
+    needs to be added. The integration plan:
+
+    When the user clicks Sign In:
+      1. Validate the form locally (Angular Reactive Forms)
+      2. Call POST to your auth endpoint with { email, password }
+      3. Receive back an access token (JWT)
+      4. Store the token in localStorage or a secure cookie
+      5. Navigate to /dashboard/home
+
+    Note: the scan backend (net-scan-backend) does not have user auth —
+    it is a service-to-service tool. You need a separate auth service or
+    add user management to the backend.
+
+  GUARD:
+    This page should use a GuestGuard — if the user is already logged in
+    (token exists in storage), redirect directly to /dashboard/home
+    so they don't see the login page unnecessarily.
+
+────────────────────────────────────────────────────────────────────────────────
+  SignUpPage
+  Route: /auth/sign-up
+  File: src/app/pages/Authentication/sign-up-page/
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    New user registration. On success, either auto-login or redirect to sign-in.
+
+  COMPONENTS ON THIS PAGE:
+    - Full name input
+    - Email input
+    - Password input
+    - Confirm password input
+    - "Create Account" button
+    - "Already have an account? Sign In" link
+
+  FORM VALIDATION:
+    - All fields required
+    - Email must be valid format
+    - Password minimum 8 characters
+    - Confirm password must match password
+
+  BACKEND INTEGRATION:
+    POST to auth endpoint with { name, email, password }
+    → 201 Created: auto-login with returned token
+    → 400 Bad Request: show field-level validation errors
+    → 409 Conflict: "Email already registered" message
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 5 — DASHBOARD PAGES & BACKEND INTEGRATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+These are the six core pages inside the DashboardLayout. Each section below
+describes what the page should show, what UI components are needed, and
+exactly which backend endpoints it calls and how.
+
+
+────────────────────────────────────────────────────────────────────────────────
+  HomePage
+  Route: /dashboard/home
+  File: src/app/pages/Dashboard/home-page/
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Overview / summary dashboard. Shows the big picture of what has been
+    scanned so far — counts, recent activity, and quick status cards.
+
+  UI COMPONENTS:
+    ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+    │ Total Assets │  │ Online Today │  │ Scan Failures│  │ Software Cnt │
+    │    1,234     │  │     987      │  │      12      │  │    45,231    │
+    └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘
+    Summary stat cards (4 across the top)
+
+    ┌────────────────────────────────┐  ┌────────────────────────────────┐
+    │  Recent Scans Table            │  │  OS Distribution Chart         │
+    │  IP | Status | Time | Method  │  │  (pie or donut: Win10/11/Svr)  │
+    └────────────────────────────────┘  └────────────────────────────────┘
+
+    ┌────────────────────────────────────────────────────────────────────┐
+    │  Quick Scan Bar: [IP input] [Method dropdown] [Scan button]       │
+    └────────────────────────────────────────────────────────────────────┘
+
+  BACKEND CALLS:
+    This page reads from locally stored scan results (database/localStorage)
+    to compute counts. It does not call the scan backend directly unless
+    a Quick Scan is triggered.
+
+    Quick Scan button → calls the same flow as ScanningPage (see below)
+    triggering POST /api/v1/scanner/scan with the entered IP.
+
+    If a result database is added: fetch aggregated stats from the
+    backend/database on page load (total scanned, success rate, OS breakdown).
+
+────────────────────────────────────────────────────────────────────────────────
+  ScanningPage
+  Route: /dashboard/scanning
+  File: src/app/pages/Dashboard/scanning-page/
+  ** Most important page — this is the core scan interface **
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    The main interface for triggering scans. Users enter IP addresses (one
+    or many), choose a scan method, enter credentials, and start scanning.
+    Results appear in real time as each machine responds.
+
+  UI COMPONENTS:
+
+  ┌─ SCAN CONFIGURATION PANEL ──────────────────────────────────────────────┐
+  │                                                                          │
+  │  Target IPs                                                              │
+  │  [Textarea: one IP per line, or paste a comma-separated list]           │
+  │  OR: [Upload CSV/TXT file button]                                        │
+  │                                                                          │
+  │  Scan Method                                                             │
+  │  [Dropdown: PowerShell | WMI | SSH | Node-WMI]                          │
+  │  [Help text showing requirements for selected method]                    │
+  │                                                                          │
+  │  Credentials                                                             │
+  │  [Username input]  [Domain input (optional)]  [Password input]          │
+  │                                                                          │
+  │  Options                                                                 │
+  │  [x] Skip Ping    [x] Skip Software    [x] Continue On Error            │
+  │                                                                          │
+  │  [Test Connection button]    [Start Scan button]                        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ PROGRESS PANEL ────────────────────────────────────────────────────────┐
+  │  Progress: 234 / 1000 IPs scanned  [===========    ] 23%               │
+  │  Running: 50  |  Completed: 184  |  Failed: 12  |  Pending: 754        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ RESULTS TABLE ─────────────────────────────────────────────────────────┐
+  │  IP Address  | Status | Hostname | OS | CPU | RAM | Method | Time      │
+  │  192.168.1.1 | ✓ Done | SERVER01 | W11| ... | 16GB| PS     | 45s       │
+  │  192.168.1.2 | ✗ Fail | —        | —  | —   | —   | PS     | Ping fail │
+  │  192.168.1.3 | ⟳ Running ...                                          │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  BACKEND INTEGRATION — STEP BY STEP:
+
+  STEP 1: Load Available Methods (on page load)
+  ──────────────────────────────────────────────
+  Call: GET /api/v1/scanner/methods
+  Purpose: Populate the method dropdown with names and requirement descriptions.
+  Response: Array of { id, name, description, requirements, linuxCompatible }
+  When received: Show each method as a dropdown option. When the user selects
+    a method, show the "requirements" text below the dropdown as a helper note
+    so they know what ports/features are needed on the target.
+
+  STEP 2: Test Connection (optional, before starting scan)
+  ─────────────────────────────────────────────────────────
+  Triggered by: "Test Connection" button
+  Call: POST /api/v1/scanner/test-connection
+  Body:
+    {
+      "target": "192.168.1.10",
+      "method": "powershell",
+      "credentials": {
+        "username": "admin",
+        "password": "password123",
+        "domain": "CORP"
+      }
+    }
+  Response success: { success: true, target: "...", method: "..." }
+  Response failure: { success: false, error: "WinRM port 5985 not reachable" }
+  UI: Show a green checkmark or red X next to the Test Connection button.
+    If failed, show the error reason so the user knows whether it is a
+    network issue (port blocked) or credentials issue (auth failed).
+
+  STEP 3: Validate Each IP in the List
+  ──────────────────────────────────────
+  Before sending to backend: split the textarea by newlines and commas,
+  strip whitespace, filter empty lines. Validate each entry against the
+  same rules as the backend (IPv4 format or valid hostname). Mark invalid
+  entries in red before the scan starts so the user can fix them.
+  This saves API round-trips for obviously bad input.
+
+  STEP 4: Ping Each IP (optional pre-flight)
+  ──────────────────────────────────────────
+  If you want to show which IPs are alive before running a full scan:
+  Call: POST /api/v1/scanner/ping  for each IP
+  Body: { "target": "192.168.1.10" }
+  Response: { alive: true/false, latency: 12 }
+  UI: Show alive/dead indicator in the results table while the full scan
+    is queued/running.
+
+  STEP 5: Run Full Scan for Each IP
+  ───────────────────────────────────
+  For each IP in the list, call POST /api/v1/scanner/scan
+  Body:
+    {
+      "target": "192.168.1.10",
+      "method": "powershell",
+      "credentials": {
+        "username": "admin",
+        "password": "password123",
+        "domain": "CORP"
+      },
+      "skipPing": false,
+      "skipSoftware": false,
+      "continueOnError": true
+    }
+
+  Response shape on success:
+    {
+      "success": true,
+      "data": {
+        "target": "192.168.1.10",
+        "method": "powershell",
+        "pingSuccess": true,
+        "connectionSuccess": true,
+        "hardware": { "Hostname": "SERVER01", "Cpu": "Intel...", ... },
+        "software": [ { "ApplicationName": "Chrome", ... }, ... ],
+        "errors": {},
+        "startedAt": "2026-04-22T10:00:00Z",
+        "completedAt": "2026-04-22T10:01:15Z"
+      }
+    }
+
+  Response shape on partial failure (continueOnError=true):
+    {
+      "success": true,
+      "message": "Scan completed with some errors",
+      "data": {
+        "pingSuccess": true,
+        "connectionSuccess": true,
+        "hardware": { ... },
+        "software": null,
+        "errors": { "software": "Registry query timed out" }
+      }
+    }
+
+  STEP 6: Control Concurrency (for multiple IPs)
+  ────────────────────────────────────────────────
+  Do NOT fire all 1000 HTTP requests at once. Use a concurrency limiter
+  in the frontend service so that only N scans are in-flight at any time.
+  Recommended N: 10-20 for a desktop app (the backend handles the rest).
+
+  Implementation pattern:
+    - Maintain a queue of pending IPs
+    - Maintain a count of active (in-flight) requests
+    - When a scan completes, pull the next IP from the queue and start it
+    - Update the progress bar after each completion
+
+  STEP 7: Display Results as They Come In
+  ─────────────────────────────────────────
+  Do not wait for all scans to finish before showing results. As each
+  scan call returns, update that row in the results table immediately.
+  The user sees live progress: rows flipping from "Running" to "Done" or
+  "Failed" one by one.
+
+  STEP 8: Save Results to Local Storage / Export
+  ────────────────────────────────────────────────
+  After each scan result arrives, save it to localStorage or IndexedDB
+  so AssetsPage and SoftwarePage can display the collected data.
+  Offer a "Export CSV" button that formats the hardware results using the
+  CSV-style field aliases already in the hardware response
+  (HostName, Operating_System, CPU, TotalPhysicalMemory (GB), etc.).
+
+────────────────────────────────────────────────────────────────────────────────
+  AssetsPage
+  Route: /dashboard/assets
+  File: src/app/pages/Dashboard/assets-page/
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Browse and search the hardware inventory collected from all scanned machines.
+    This is a read-only view of scan results — it does not trigger new scans.
+
+  UI COMPONENTS:
+
+  ┌─ FILTERS BAR ──────────────────────────────────────────────────────────┐
+  │  Search: [hostname or IP...]  OS: [All▼]  Manufacturer: [All▼]        │
+  │  Scan Date: [Last 7 days▼]   Method: [All▼]   [Reset Filters]        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ ASSETS TABLE ─────────────────────────────────────────────────────────┐
+  │ Hostname  | IP        | OS           | CPU        | RAM   | Disks     │
+  │ SERVER01  | 192.168.1 | Windows 11   | Intel i7   | 16 GB | C: 512GB  │
+  │ SERVER02  | 192.168.2 | Windows Svr  | Xeon E5    | 64 GB | C: 1TB    │
+  │ [row click → Asset Detail Panel slides in from right]                 │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ ASSET DETAIL PANEL (slide-in) ────────────────────────────────────────┐
+  │ SERVER01  (192.168.1.10)                                               │
+  │ Tabs: Hardware | Software | Scan History                               │
+  │                                                                        │
+  │ Hardware tab:                                                          │
+  │  Manufacturer: Dell Inc.          Model: OptiPlex 7090                │
+  │  CPU: Intel Core i7-10700 @ 2.90GHz                                   │
+  │  Cores: 8 physical, 16 logical   RAM: 16 GB                           │
+  │  Disks: C: (512 GB), D: (1 TB)   GPU: Intel UHD 630                  │
+  │  OS: Windows 11 Pro (Build 22631) Arch: 64-bit                        │
+  │  Domain: CORP.LOCAL               License: Windows 11 Pro (Active)    │
+  │  Serial: DELLXXXXX                MAC: AA:BB:CC:DD:EE:FF              │
+  │  IPs: 192.168.1.10, 10.0.0.5     Last Scan: 22-04-2026 10:15:30 AM  │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  BACKEND INTEGRATION:
+    AssetsPage reads from locally stored scan results (fetched during scanning).
+    It does NOT call the backend directly. The data pipeline is:
+      ScanningPage → receives scan results → stores in local state/DB
+      AssetsPage → reads from same local state/DB → displays
+
+    Optional: Add a "Re-scan" button on the Asset Detail Panel that calls
+    POST /api/v1/scanner/scan for that specific IP and updates the record.
+
+    Optional: Add a "Hardware Only Refresh" button that calls
+    POST /api/v1/scanner/hardware for faster hardware-only update.
+
+  EXPORT:
+    Export All → CSV file with all hardware fields using the CSV-style aliases
+    (HostName, Operating_System, CPU, TotalPhysicalMemory (GB), Drives, etc.)
+    Export Selected → same but only checked rows
+
+────────────────────────────────────────────────────────────────────────────────
+  SoftwarePage
+  Route: /dashboard/software
+  File: src/app/pages/Dashboard/software-page/
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Browse installed software across all scanned machines. Shows which machines
+    have which applications installed. Useful for license auditing and compliance.
+
+  UI COMPONENTS:
+
+  ┌─ FILTERS BAR ──────────────────────────────────────────────────────────┐
+  │  Search App: [Chrome...]   Publisher: [All▼]   Machine: [All▼]        │
+  │  Installed After: [date]   Installed Before: [date]   [Reset]         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  VIEW TOGGLE:
+    [By Application]  [By Machine]
+
+    By Application view:
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ App Name       | Version  | Publisher | Install Count | Machines   │
+    │ Google Chrome  | 124.0    | Google    | 142 machines  | [View]     │
+    │ Microsoft 365  | 16.0     | Microsoft | 89 machines   | [View]     │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    By Machine view:
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │ Machine        | App Count | Apps                                   │
+    │ SERVER01       | 45 apps   | Chrome, Teams, Office...  [View All]  │
+    └─────────────────────────────────────────────────────────────────────┘
+
+  BACKEND INTEGRATION:
+    Same as AssetsPage — reads from locally stored scan results.
+    The software data is already in local state from when ScanningPage
+    ran the full scan and stored the software array per machine.
+
+    Optional refresh: POST /api/v1/scanner/software for one machine.
+    Body: { "target": "192.168.1.10", "method": "powershell", "credentials": {...} }
+    Response: { hostname, count, software: [...] }
+
+  EXPORT:
+    Export CSV with fields: Hostname, Application_Name, Version, Publisher,
+    InstallDate, SerialNumber, Status, Remark, Last_Scan_Time
+    (These CSV-alias names are already in the response from the backend.)
+
+────────────────────────────────────────────────────────────────────────────────
+  ReportsPage
+  Route: /dashboard/reports
+  File: src/app/pages/Dashboard/reports-page/
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Generate and export reports from collected scan data. Preset report
+    templates plus custom field selection.
+
+  UI COMPONENTS:
+
+  ┌─ REPORT TEMPLATES ─────────────────────────────────────────────────────┐
+  │  [Hardware Inventory Report]   [Software License Report]              │
+  │  [OS Distribution Report]      [Network Topology Report]             │
+  │  [Scan Success/Failure Report] [Custom Report Builder]               │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ REPORT CONFIGURATION ─────────────────────────────────────────────────┐
+  │  Report Title: [Hardware Inventory - April 2026]                      │
+  │  Date Range: [All time▼] or [From: date] [To: date]                  │
+  │  Group By: [None▼ | OS | Manufacturer | Domain | Scan Method]        │
+  │  Columns: [x] Hostname [x] IP [x] OS [x] CPU [x] RAM [x] Disks ...  │
+  │  Format: [CSV▼ | Excel | PDF]   [Generate Report]                    │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  BACKEND INTEGRATION:
+    ReportsPage reads from local scan data — no new backend calls needed.
+    However, if a server-side report generation is desired (e.g., very large
+    datasets or PDF rendering):
+      POST to a future /api/v1/reports/generate endpoint
+      Body: { template, dateRange, columns, format }
+      Response: file download stream or a link to the generated file
+
+────────────────────────────────────────────────────────────────────────────────
+  ConfigurationPage
+  Route: /dashboard/configuration
+  File: src/app/pages/Dashboard/configuration-page/
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    App-wide settings. Backend URL, default scan method, credential presets,
+    scan timeout values, and display preferences.
+
+  UI COMPONENTS:
+
+  ┌─ BACKEND CONNECTION ───────────────────────────────────────────────────┐
+  │  Backend URL: [http://localhost:3000/api/v1]      [Test Connection]   │
+  │  Status: ● Connected (200ms) / ✗ Unreachable                         │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ DEFAULT SCAN SETTINGS ────────────────────────────────────────────────┐
+  │  Default Method: [PowerShell▼]                                        │
+  │  Default Domain: [CORP]                                               │
+  │  Skip Ping by default: [ ]    Skip Software by default: [ ]          │
+  │  Continue On Error by default: [x]                                    │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ SCAN PERFORMANCE ─────────────────────────────────────────────────────┐
+  │  Max Concurrent Scans: [10] (controls frontend throttle)              │
+  │  Request Timeout: [120] seconds                                       │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ CREDENTIAL PRESETS ───────────────────────────────────────────────────┐
+  │  Save named credential sets for reuse:                                │
+  │  [Add Preset]                                                         │
+  │  Name: "Corp Admin"   User: admin   Domain: CORP   [Edit] [Delete]   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌─ DATA MANAGEMENT ──────────────────────────────────────────────────────┐
+  │  [Clear All Scan Results]  [Export All Data]  [Import Scan Data]      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  BACKEND INTEGRATION:
+    "Test Connection" button calls GET /api/v1/scanner/methods
+    If a 200 response comes back → shows "Connected".
+    If it fails or times out → shows "Unreachable" with the error.
+
+    All other settings are stored in localStorage/electron store — they are
+    local preferences that configure how the Angular app behaves, not backend
+    settings.
+
+    The Backend URL setting is passed to the ScannerService so all API calls
+    use the configured base URL (allows pointing to a remote scan backend
+    instead of localhost).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 6 — SERVICES (The Angular Layer That Calls the Backend)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Services are Angular singleton classes injected into components. They hold
+the logic for all HTTP calls and keep components clean.
+
+────────────────────────────────────────────────────────────────────────────────
+  ScannerService
+  File: src/app/services/scanner.service.ts  (to be created)
+  Used by: ScanningPage, HomePage (quick scan), AssetsPage (re-scan)
+────────────────────────────────────────────────────────────────────────────────
+
+  This is the central service for all scan backend calls.
+
+  PROPERTIES:
+    baseUrl       : string  — read from ConfigurationService (default: http://localhost:3000/api/v1)
+    activeMethods : Signal<MethodInfo[]>  — cached list from GET /methods
+
+  METHODS:
+
+  getMethods()
+  ─────────────
+  CALLS: GET /api/v1/scanner/methods
+  RETURNS: Observable<MethodInfo[]>
+  WHEN: Called on ScanningPage init and ConfigurationPage Test Connection.
+  HOW: Makes HTTP GET. On success, caches result in a signal so components
+    don't need to call it on every load.
+
+  ping(target: string)
+  ─────────────────────
+  CALLS: POST /api/v1/scanner/ping
+  BODY: { target }
+  RETURNS: Observable<PingResult>  — { alive, target, latencyMs }
+  WHEN: Called by ScanningPage if user wants to pre-check alive status,
+    or by HomePage quick scan pre-flight.
+
+  testConnection(target, method, credentials)
+  ─────────────────────────────────────────────
+  CALLS: POST /api/v1/scanner/test-connection
+  BODY: { target, method, credentials: { username, password, domain? } }
+  RETURNS: Observable<ConnectionTestResult>  — { success, error? }
+  WHEN: Called when user clicks "Test Connection" button.
+
+  fetchHardware(target, method, credentials)
+  ───────────────────────────────────────────
+  CALLS: POST /api/v1/scanner/hardware
+  BODY: { target, method, credentials }
+  RETURNS: Observable<HardwareInfo>
+  WHEN: Called by AssetsPage "Hardware Refresh" button for a single machine.
+
+  fetchSoftware(target, method, credentials)
+  ───────────────────────────────────────────
+  CALLS: POST /api/v1/scanner/software
+  BODY: { target, method, credentials }
+  RETURNS: Observable<{ hostname, count, software: SoftwareEntry[] }>
+  WHEN: Called by SoftwarePage "Software Refresh" for a single machine.
+
+  fullScan(options: FullScanOptions)
+  ────────────────────────────────────
+  CALLS: POST /api/v1/scanner/scan
+  BODY:
+    {
+      target: string,
+      method: string,
+      credentials: { username, password, domain? },
+      skipPing: boolean,
+      skipSoftware: boolean,
+      continueOnError: boolean
+    }
+  RETURNS: Observable<ScanResult>
+  WHEN: Called by ScanningPage for each IP in the scan list.
+
+  scanMultiple(ips, method, credentials, options, concurrency = 10)
+  ──────────────────────────────────────────────────────────────────
+  NOT a direct backend call — this is a frontend orchestration method.
+  HOW IT WORKS:
+    Maintains a queue of IPs. Starts `concurrency` number of fullScan()
+    calls simultaneously. As each one finishes, it pulls the next IP from
+    the queue and starts a new scan. Emits progress events (completed count,
+    failed count, each result as it arrives) as an Observable so the
+    ScanningPage can update the UI in real time.
+  WHEN: Called by ScanningPage "Start Scan" button when multiple IPs are entered.
+
+────────────────────────────────────────────────────────────────────────────────
+  ScanStoreService
+  File: src/app/services/scan-store.service.ts  (to be created)
+  Used by: ScanningPage (writes), AssetsPage, SoftwarePage, ReportsPage (reads)
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    In-memory + persistent store for all scan results. Acts as the shared
+    data layer between pages. ScanningPage writes results as they arrive.
+    All other pages read from this store.
+
+  PROPERTIES:
+    results : Signal<ScanResult[]>  — reactive list of all scan results
+    summary : computed signal  — derived stats (total, alive, failed, OS counts)
+
+  METHODS:
+
+  addResult(result: ScanResult)
+    Called by ScanningPage after each scan completes.
+    Adds to the in-memory Signal and persists to localStorage or IndexedDB.
+
+  getResults()
+    Returns all stored ScanResult objects.
+
+  getByIp(ip: string)
+    Returns the latest scan result for a specific IP.
+
+  clearAll()
+    Clears all results. Called from ConfigurationPage "Clear All Scan Results".
+
+  exportToCsv(fields?: string[])
+    Formats hardware results as CSV using the CSV-alias field names.
+    Returns a Blob that can be downloaded via a URL.createObjectURL() link.
+
+  loadFromStorage()
+    Called on app startup to restore previous scan results from localStorage
+    so users don't lose data when they close and reopen the app.
+
+────────────────────────────────────────────────────────────────────────────────
+  ConfigurationService
+  File: src/app/services/configuration.service.ts  (to be created)
+  Used by: ScannerService (reads baseUrl), ScanningPage (reads defaults)
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Reads and writes user preferences stored in localStorage or Electron Store.
+
+  METHODS:
+
+  getBackendUrl()        → string  (default: 'http://localhost:3000/api/v1')
+  setBackendUrl(url)     → saves to localStorage
+  getDefaultMethod()     → ScanMethod  (default: 'powershell')
+  getMaxConcurrency()    → number  (default: 10)
+  getCredentialPresets() → CredentialPreset[]
+  saveCredentialPreset(preset)
+  deleteCredentialPreset(id)
+
+────────────────────────────────────────────────────────────────────────────────
+  ToastService
+  File: src/app/services/toast.ts  (already exists)
+  Used by: All pages
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Shows notification toasts (success, error, warning, info) that appear
+    briefly and disappear. Used after scan completion, export, errors, etc.
+
+  METHODS:
+  show(message, type: 'success' | 'error' | 'warning' | 'info', duration?)
+    Triggers the ToasterComponent to display the message.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 7 — SHARED COMPONENTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+  ToasterComponent
+  File: src/app/components/toaster/  (already exists)
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Renders notification pop-ups in the top-right corner of the screen.
+    Positioned in the root AppComponent so it sits above all page content.
+
+  HOW IT WORKS:
+    Listens to ToastService. When a toast is added, renders a floating card
+    with the message and type styling (green for success, red for error, etc.).
+    Auto-dismisses after a configurable duration (default 3-5 seconds).
+    Multiple toasts stack vertically.
+
+────────────────────────────────────────────────────────────────────────────────
+  Components To Build (Shared/Reusable)
+────────────────────────────────────────────────────────────────────────────────
+
+  IpInputComponent
+  ─────────────────
+  File: src/app/components/ip-input/
+  A textarea that accepts multiple IPs (one per line or comma-separated),
+  validates each entry in real time, highlights invalid ones in red, and
+  emits a clean string[] of valid IPs to the parent component.
+  Also includes a "Upload File" button for loading IPs from a .txt or .csv.
+
+  CredentialFormComponent
+  ─────────────────────────
+  File: src/app/components/credential-form/
+  A reusable form group: Username + Domain (optional) + Password (with show/hide).
+  Also includes a "Use Preset" dropdown that loads saved credentials from
+  ConfigurationService. Used in ScanningPage and tested in ConfigurationPage.
+
+  MethodSelectorComponent
+  ─────────────────────────
+  File: src/app/components/method-selector/
+  A dropdown that shows the four scan methods. On selection, shows the
+  requirements text for that method below the dropdown. Marks WMI and
+  Node-WMI as "Windows only" if the backend reports it is running on Linux.
+
+  ProgressBarComponent
+  ──────────────────────
+  File: src/app/components/progress-bar/
+  Shows scan progress with: total, completed, failed, pending, and a visual
+  bar. Updates in real time as scan results arrive.
+
+  ScanResultTableComponent
+  ──────────────────────────
+  File: src/app/components/scan-result-table/
+  A data table showing scan results as they arrive. Columns: IP, Status,
+  Hostname, OS, CPU, RAM, Method, Duration. Row click opens asset detail.
+  Supports sorting, filtering, and virtual scrolling for large result sets.
+
+  AssetDetailPanelComponent
+  ───────────────────────────
+  File: src/app/components/asset-detail-panel/
+  A slide-in side panel showing full hardware and software details for one
+  machine. Has tabs: Hardware | Software | Network | Scan History.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 8 — GUARDS (Route Protection)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Guards control who can access which routes.
+
+────────────────────────────────────────────────────────────────────────────────
+  AuthGuard
+  File: src/app/guards/auth-guard.ts  (exists but empty canActivate[])
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Protects all /dashboard/* routes. If the user is not logged in (no
+    valid token in storage), redirect to /auth/sign-in.
+
+  HOW IT WORKS:
+    1. Check if a token exists in localStorage
+    2. If token exists and is not expired → allow navigation
+    3. If no token or expired → redirect to /auth/sign-in, save the
+       intended URL so after login the user is sent to the right page
+
+  WHERE TO ADD IT:
+    In app.routes.ts, add canActivate: [AuthGuard] to the /dashboard route.
+
+────────────────────────────────────────────────────────────────────────────────
+  GuestGuard
+  File: src/app/guards/guest-guard.ts  (exists but empty)
+────────────────────────────────────────────────────────────────────────────────
+
+  PURPOSE:
+    Prevents logged-in users from seeing the login/signup pages.
+    If already authenticated, redirect to /dashboard/home.
+
+  WHERE TO ADD IT:
+    In app.routes.ts, add canActivate: [GuestGuard] to the /auth route.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 9 — DATA TYPES (Frontend Models Matching Backend Responses)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Create these TypeScript interfaces in src/app/models/scanner.models.ts
+to match the backend response shapes exactly.
+
+  ScanMethod:
+    'powershell' | 'wmi' | 'ssh' | 'node-wmi'
+
+  ScanCredentials:
+    { username: string, password: string, domain?: string }
+
+  FullScanOptions:
+    { target, method, credentials, skipPing, skipSoftware, continueOnError }
+
+  PingResult:
+    { alive: boolean, target: string, latencyMs?: number }
+
+  ConnectionTestResult:
+    { success: boolean, target: string, method: ScanMethod, error?: string }
+
+  DiskInfo:
+    { deviceId: string, sizeGB: number }
+
+  NetworkAdapterInfo:
+    { name: string, macAddress: string, ipAddresses: string[] }
+
+  HardwareInfo:
+    { Hostname, Domain, Manufacturer, Model, Cpu, TotalPhysicalMemoryGB,
+      OperatingSystem, OsArchitecture, BuildNumber, Disks: DiskInfo[],
+      NetworkAdapters: NetworkAdapterInfo[], BiosSerialNumber, ...
+      and all CSV aliases: HostName, CPU, Operating_System, etc. }
+
+  SoftwareEntry:
+    { ApplicationName, Version, Publisher, SerialNumber, InstallDate,
+      RegistryPath, Hostname, Status, Last_Scan_Time }
+
+  ScanResult:
+    { target, method, pingSuccess, connectionSuccess,
+      hardware?: HardwareInfo, software?: SoftwareEntry[],
+      errors: Record<string, string>, startedAt, completedAt }
+
+  ApiResponse<T>:
+    { success: boolean, message: string, data: T,
+      meta: { timestamp, requestId, duration } }
+
+  MethodInfo:
+    { id: ScanMethod, name: string, description: string,
+      requirements: string, powershellRequired: boolean, linuxCompatible: boolean }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 10 — HTTP INTERCEPTORS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Interceptors run on every HTTP request and response, allowing cross-cutting
+concerns to be handled in one place.
+
+  AuthInterceptor  (to be created)
+  ──────────────────────────────────
+  File: src/app/interceptors/auth.interceptor.ts
+  PURPOSE: Attaches the JWT token to every outgoing request.
+  HOW: Reads the token from localStorage, adds header:
+    Authorization: Bearer <token>
+  WHERE TO ADD: In app.config.ts → provideHttpClient(withInterceptors([authInterceptor]))
+
+  ErrorInterceptor  (to be created)
+  ────────────────────────────────────
+  File: src/app/interceptors/error.interceptor.ts
+  PURPOSE: Handles HTTP errors globally without repeating error handling in every service.
+  HOW:
+    - 401 Unauthorized → clear token, redirect to /auth/sign-in
+    - 429 Too Many Requests → show "Rate limit reached, please slow down" toast
+    - 503 / 504 → show "Backend not reachable" toast
+    - 400 Validation Error → extract the Zod error details and show in a toast
+    - 500 → show generic "Unexpected error" toast
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 11 — COMPLETE BACKEND ENDPOINT INTEGRATION REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Quick reference: which endpoint is called from where in the frontend.
+
+  ENDPOINT                          FRONTEND CALLER          WHEN
+  ──────────────────────────────    ─────────────────────    ─────────────────────────────────
+  GET  /methods                     ScannerService           ScanningPage init, ConfigPage
+  POST /ping                        ScannerService           ScanningPage pre-flight, QuickScan
+  POST /test-connection             ScannerService           "Test Connection" button click
+  POST /hardware                    ScannerService           AssetsPage "Refresh Hardware" button
+  POST /software                    ScannerService           SoftwarePage "Refresh Software" btn
+  POST /scan                        ScannerService           ScanningPage per-IP scan loop
+
+  ALL requests pass through:
+    AuthInterceptor  → adds Authorization: Bearer <token>
+    ErrorInterceptor → handles 401, 429, 503, 500 globally
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 12 — SCANNING FLOW (Full End-to-End from UI to Backend and Back)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+This is the complete flow when a user enters 500 IPs and clicks "Start Scan":
+
+  USER ACTIONS
+  ─────────────
+  1. User types or pastes IPs into the textarea (or uploads a file)
+  2. IpInputComponent validates each IP in real time — red highlight = invalid
+  3. User selects method from MethodSelectorComponent dropdown
+  4. User enters credentials in CredentialFormComponent
+     (or selects a saved preset from ConfigurationService)
+  5. User optionally clicks "Test Connection" → shows ✓ or ✗ result
+  6. User clicks "Start Scan"
+
+  FRONTEND PROCESSING
+  ─────────────────────
+  7. ScanningPage collects valid IP list, method, credentials, options
+  8. Calls ScannerService.scanMultiple(ips, method, credentials, options, concurrency=10)
+  9. scanMultiple() initializes a queue of 500 IPs and starts 10 concurrent scans
+
+  CONCURRENT SCAN EXECUTION (per IP)
+  ─────────────────────────────────────
+  10. ScannerService.fullScan({ target: "192.168.1.1", method, credentials, ... })
+  11. Angular HttpClient sends POST /api/v1/scanner/scan to the backend
+  12. AuthInterceptor adds Bearer token to the request header
+  13. Request arrives at net-scan-backend
+
+  BACKEND PROCESSING
+  ───────────────────
+  14. Rate limit check → allowed
+  15. Zod schema validates: IP format, method enum, credentials present
+  16. Request ID (UUID) and startTime attached
+  17. ScannerService.fullScan() starts:
+      a. pingHost("192.168.1.1")  → spawn OS ping → alive: true, 12ms latency
+      b. getMethod("powershell").testConnection() → TCP check port 5985 → open
+         → run tiny PS script → hostname returned → connection: success
+      c. getMethod("powershell").fetchHardwareInfo() → write temp .ps1 file
+         → spawn powershell.exe -File → WMI queries run on target
+         → JSON returned → temp file deleted
+         → normalizeHardware() flattens field names
+      d. getMethod("powershell").fetchSoftwareInfo() → write temp .ps1 file
+         → registry query on target → JSON array returned → temp file deleted
+         → normalizeSoftware() adds timestamps and aliases
+  18. Response built: { success: true, data: { hardware, software, ... }, meta }
+  19. HTTP 200 sent back
+
+  FRONTEND RECEIVES RESULT
+  ─────────────────────────
+  20. Observable emits the ScanResult for that IP
+  21. ScannerService.scanMultiple() emits a progress event
+  22. ScanningPage receives the event, updates the results table row:
+      192.168.1.1 → Status: ✓ Done | Hostname: SERVER01 | OS: Win11 | ...
+  23. ScanStoreService.addResult(result) → stored in memory + localStorage
+  24. Progress bar updates: 1/500 complete
+  25. scanMultiple() pulls the next IP from the queue and starts scan #11
+  26. Steps 10-25 repeat until all 500 IPs are done
+
+  AFTER ALL SCANS COMPLETE
+  ──────────────────────────
+  27. ToastService shows "Scan complete: 487 succeeded, 13 failed"
+  28. "Export CSV" button becomes enabled
+  29. AssetsPage and SoftwarePage can now show the collected data
+  30. Results persist in localStorage — visible on next app open
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 13 — ANGULAR MATERIAL COMPONENTS TO USE (UI Kit)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Angular Material (@angular/material v21) is already installed. Use these
+components to build consistent UI without custom CSS from scratch.
+
+  INPUT FIELDS
+    MatFormField + MatInput       → text inputs (IP, hostname, URL)
+    MatSelect + MatOption         → dropdowns (method, preset selection)
+    MatCheckbox                   → toggle options (skip ping, skip software)
+    MatSlideToggle                → on/off switches (continue on error)
+    MatTextareaAutosize           → growing textarea for IP list input
+
+  BUTTONS & ACTIONS
+    MatButton (mat-button)        → secondary actions (cancel, reset)
+    MatButton (mat-raised-button) → primary actions (Scan, Test Connection)
+    MatButton (mat-stroked-button)→ outlined buttons (export, upload)
+    MatIconButton                 → icon-only buttons (close, refresh)
+    MatIcon                       → icons (check, error, refresh, download)
+
+  TABLES & LISTS
+    MatTable + MatSort            → scan results table with sortable columns
+    MatPaginator                  → pagination for large result sets
+    CdkVirtualScrollViewport      → virtual scroll for 10,000+ row tables
+
+  LAYOUT
+    MatSidenav + MatSidenavContent→ left sidebar navigation in DashboardLayout
+    MatToolbar                    → top bar in DashboardLayout
+    MatCard                       → stat summary cards on HomePage
+    MatTabs                       → tabs in AssetDetailPanel (Hardware/Software)
+    MatExpansionPanel             → collapsible sections in ConfigurationPage
+
+  FEEDBACK
+    MatProgressBar                → scan progress bar
+    MatProgressSpinner            → loading spinner while fetching
+    MatSnackBar                   → toasts (or use custom ToasterComponent)
+    MatDialog                     → confirmation dialogs (clear all data, etc.)
+    MatTooltip                    → hover hints on buttons and icons
+
+  NAVIGATION
+    MatMenu                       → dropdown menu (user menu, export options)
+    MatBadge                      → notification badge (failed scan count)
+
+  FORMS
+    ReactiveFormsModule           → FormGroup + FormControl for all forms
+    MatError                      → inline validation error messages below inputs
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PART 14 — FILE STRUCTURE (Where To Create Everything)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  src/app/
+  ├── app.ts                      root component (hosts ToasterComponent)
+  ├── app.routes.ts               all routes (add guards here)
+  ├── app.config.ts               providers (add interceptors here)
+  │
+  ├── models/
+  │   └── scanner.models.ts       all TypeScript interfaces for backend types
+  │
+  ├── services/
+  │   ├── scanner.service.ts      all backend HTTP calls
+  │   ├── scan-store.service.ts   scan result storage + export
+  │   ├── configuration.service.ts user preferences
+  │   └── toast.ts                (already exists)
+  │
+  ├── interceptors/
+  │   ├── auth.interceptor.ts     adds Bearer token to requests
+  │   └── error.interceptor.ts    handles HTTP errors globally
+  │
+  ├── guards/
+  │   ├── auth-guard.ts           (exists — add logic)
+  │   └── guest-guard.ts          (exists — add logic)
+  │
+  ├── components/                 reusable shared components
+  │   ├── toaster/                (already exists)
+  │   ├── ip-input/               textarea + file upload + validation
+  │   ├── credential-form/        username + domain + password
+  │   ├── method-selector/        dropdown + requirements helper text
+  │   ├── progress-bar/           scan progress display
+  │   ├── scan-result-table/      live updating results table
+  │   └── asset-detail-panel/     slide-in hardware/software detail
+  │
+  ├── layouts/
+  │   ├── authentication-layout/  (exists — add logo + card layout)
+  │   ├── dashboard-layout/       (exists — add sidebar + topbar)
+  │   ├── empty-layout/           (exists)
+  │   └── payment-layout/         (exists — reserved)
+  │
+  └── pages/
+      ├── Authentication/
+      │   ├── sign-in-page/       (exists — add form + service call)
+      │   └── sign-up-page/       (exists — add form + service call)
+      └── Dashboard/
+          ├── home-page/          (exists — add stat cards + quick scan)
+          ├── scanning-page/      (exists — main scan interface)
+          ├── assets-page/        (exists — hardware inventory table)
+          ├── software-page/      (exists — software inventory table)
+          ├── reports-page/       (exists — report generation)
+          └── configuration-page/ (exists — settings)
+
+================================================================================
+  END OF FRONTEND GUIDE
+================================================================================

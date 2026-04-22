@@ -1,0 +1,1077 @@
+================================================================================
+  NET-SCAN  —  TECHNICAL ARCHITECTURE DOCUMENT
+================================================================================
+  Version   : 1.0
+  Project   : Net-Scan — Network Asset Discovery & Inventory System
+  Prepared  : April 2026
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. ARCHITECTURE OVERVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Net-Scan is built on a three-layer architecture:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 1  — PRESENTATION (Frontend)                                      │
+  │  Angular 21 + Electron Desktop Application                               │
+  │  Responsible for: UI, user input, API communication, local data storage  │
+  └──────────────────────────────────────┬───────────────────────────────────┘
+                                         │ HTTP/REST API calls
+                                         │ (JSON over HTTP)
+  ┌──────────────────────────────────────▼───────────────────────────────────┐
+  │  LAYER 2  — APPLICATION (Backend)                                        │
+  │  Node.js 18 + Express 4 + TypeScript                                     │
+  │  Responsible for: Business logic, scan orchestration, protocol handling  │
+  └──────────────────────────────────────┬───────────────────────────────────┘
+                                         │ WinRM / DCOM / SSH / ICMP
+  ┌──────────────────────────────────────▼───────────────────────────────────┐
+  │  LAYER 3  — TARGET MACHINES (Windows / Linux Endpoints)                  │
+  │  Remote machines being scanned                                           │
+  │  Responsible for: Serving hardware/software data on request              │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+ARCHITECTURE PRINCIPLE:
+  The architecture is built on the principle of separation of concerns.
+  The frontend never talks directly to target machines — it only talks to
+  the backend API. The backend is the only layer that holds credentials,
+  spawns processes, and communicates with remote endpoints. This keeps the
+  frontend lightweight, testable, and platform-independent.
+
+  The backend itself is stateless — it holds no session state between
+  requests. Every request carries everything needed (target, method,
+  credentials). This makes the backend horizontally scalable: you can
+  run 10 identical instances behind a load balancer and every one of them
+  can handle any request.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  2. FRONTEND ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Technology Stack
+  ─────────────────
+  ┌────────────────────────┬──────────────────────────────────────────────────┐
+  │ Component              │ Technology & Version                             │
+  ├────────────────────────┼──────────────────────────────────────────────────┤
+  │ Framework              │ Angular 21                                       │
+  │ Language               │ TypeScript 5                                     │
+  │ UI Component Library   │ Angular Material 21                              │
+  │ Desktop Shell          │ Electron 41                                      │
+  │ HTTP Client            │ Angular HttpClient (built into Angular)          │
+  │ Routing                │ Angular Router (hash-based)                      │
+  │ Forms                  │ Angular Reactive Forms                           │
+  │ Local Express Server   │ Express 4 (bundled inside the Electron app)      │
+  │ Build Tool             │ Angular CLI + electron-builder                   │
+  │ Package Manager        │ npm                                              │
+  └────────────────────────┴──────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+  2.1  ANGULAR 21  (Core Frontend Framework)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Angular is a full-featured frontend framework by Google built on TypeScript.
+    It provides a structured way to build web applications using components,
+    services, dependency injection, routing, and reactive programming (Signals).
+
+  HOW IT IS USED IN NET-SCAN:
+    Every screen (login, scanning, assets, software, reports, configuration)
+    is built as an Angular component. Services handle all data fetching and
+    state management. The router controls which component is visible based
+    on the URL.
+
+  BENEFIT:
+    - Strong TypeScript typing catches bugs at compile time, before they
+      reach production
+    - Dependency injection makes services reusable and easy to test
+    - Signals (Angular 17+) give reactive, efficient UI updates — only
+      the parts of the page that need to change are re-rendered
+    - Lazy loading: each page's code is only downloaded when navigated to,
+      keeping initial load time fast even as the app grows
+    - Angular CLI enforces a consistent project structure so any developer
+      can find their way around the codebase immediately
+
+────────────────────────────────────────────────────────────────────────────────
+  2.2  ELECTRON 41  (Desktop Shell)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Electron is a framework for building native desktop applications using
+    web technologies (HTML, CSS, JavaScript). It wraps Chromium (a browser
+    engine) and Node.js into a single executable. The Angular app runs inside
+    this Chromium window.
+
+  HOW IT IS USED IN NET-SCAN:
+    Electron packages the Angular app as a .exe file that users install on
+    Windows. When launched, Electron starts:
+      1. The Angular frontend (served from built static files)
+      2. A local Express server (for health checks and future local API needs)
+      3. The browser window that renders the Angular app
+
+    In development, Electron connects to the Angular CLI dev server at
+    localhost:4200. In production, it loads from the compiled dist/ folder.
+
+  BENEFIT:
+    - Users get a native desktop experience (taskbar icon, window controls,
+      no browser address bar, works offline)
+    - The app can be distributed as a single .exe installer via electron-builder
+    - Electron can access local system APIs (file system, native dialogs)
+      which a web app in a browser cannot
+    - Updates can be pushed silently via auto-update mechanisms
+
+────────────────────────────────────────────────────────────────────────────────
+  2.3  ANGULAR MATERIAL 21  (UI Component Library)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Angular Material is Google's official UI component library for Angular.
+    It implements the Material Design specification — a design system used
+    across Google's products. It provides ready-built, accessible, themed
+    UI components.
+
+  HOW IT IS USED IN NET-SCAN:
+    Every visual element in the app uses Angular Material components:
+    data tables (scan results), form inputs (credentials, IP entry), dropdowns
+    (method selection), progress bars (scan progress), side navigation
+    (dashboard layout), dialogs (confirmations), tabs (asset detail view),
+    and toast notifications.
+
+  BENEFIT:
+    - 40+ production-quality components built and maintained by Google
+    - Full accessibility (ARIA) support out of the box
+    - Consistent theming across the entire app with one CSS variable change
+    - CDK (Component Dev Kit) provides virtual scrolling for tables with
+      10,000+ rows — essential for displaying large scan results without
+      freezing the UI
+    - No need to build and maintain custom UI components
+
+────────────────────────────────────────────────────────────────────────────────
+  2.4  ANGULAR HTTPCLIENT  (API Communication Layer)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Angular's built-in HTTP client module. It wraps the browser's native
+    fetch/XMLHttpRequest with an Observable-based API, supports interceptors,
+    typed responses, and automatic JSON serialization.
+
+  HOW IT IS USED IN NET-SCAN:
+    HttpClient is used exclusively inside the ScannerService to make all
+    API calls to the backend. No other part of the app makes HTTP calls
+    directly — they all go through the service layer.
+
+    The API call flow:
+      Component → calls ScannerService method
+      ScannerService → uses HttpClient.post() / .get()
+      AuthInterceptor → automatically adds Bearer token to the request
+      ErrorInterceptor → catches HTTP errors before they reach the component
+      Backend → processes and responds
+      ScannerService → returns typed Observable to component
+      Component → subscribes and updates UI
+
+  BENEFIT:
+    - Interceptors allow cross-cutting concerns (auth headers, error handling,
+      logging) to be written once and applied to every HTTP call automatically
+    - Observables allow the component to react to the response asynchronously
+      without blocking the UI thread
+    - Typed responses (HttpClient.post<ApiResponse<ScanResult>>()) catch
+      shape mismatches between frontend types and backend responses at
+      compile time
+    - Automatic JSON serialization/deserialization
+
+────────────────────────────────────────────────────────────────────────────────
+  2.5  ANGULAR REACTIVE FORMS  (Form Handling)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Angular's programmatic form management system. Forms are defined as
+    TypeScript objects (FormGroup, FormControl) with validation rules
+    attached. The template binds to these objects rather than managing
+    form state in the DOM.
+
+  HOW IT IS USED IN NET-SCAN:
+    Every form in the app (sign-in, scan configuration, credential entry,
+    IP address list input) uses Reactive Forms. Validation rules (required,
+    IP format, password minimum length) are declared in TypeScript and
+    evaluated in real time as the user types.
+
+  BENEFIT:
+    - Validation happens client-side instantly — no round-trip to the server
+      for obviously invalid input like an empty password or malformed IP
+    - Form state (valid, invalid, dirty, touched) is available programmatically,
+      so the "Start Scan" button can be disabled until all fields are valid
+    - Complex cross-field validation (e.g., confirm password must match
+      password) is straightforward
+
+────────────────────────────────────────────────────────────────────────────────
+  2.6  ANGULAR ROUTER  (Navigation)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Angular's built-in client-side router. Maps URL paths to components
+    and handles navigation without full page reloads.
+
+  HOW IT IS USED IN NET-SCAN:
+    Hash-based routing (#/) is enabled so routes work inside Electron's
+    file:// URL without a server. Guards protect routes — unauthenticated
+    users are redirected to /auth/sign-in, authenticated users are
+    redirected away from /auth/sign-in to /dashboard/home. Lazy loading
+    is configured for all dashboard pages.
+
+  BENEFIT:
+    - Hash routing makes the app work in Electron without any server-side
+      routing configuration
+    - Route guards enforce authentication at the navigation level, not
+      just in the UI — a user cannot navigate to a protected URL directly
+    - Lazy loading splits the app bundle by page — only the code needed
+      for the current page is loaded, keeping startup fast
+
+────────────────────────────────────────────────────────────────────────────────
+  2.7  FRONTEND COMPONENT STRUCTURE
+────────────────────────────────────────────────────────────────────────────────
+
+  The frontend follows Angular's recommended architecture pattern:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  PAGES  (smart components — know about services, hold page-level state)  │
+  │  ScanningPage, AssetsPage, SoftwarePage, ReportsPage, ConfigPage, Home  │
+  └────────────────────────────────────────┬─────────────────────────────────┘
+                                           │ inject & call
+  ┌──────────────────────────────────────▼─────────────────────────────────┐
+  │  SERVICES  (business logic & HTTP — no UI)                              │
+  │  ScannerService → all backend API calls                                 │
+  │  ScanStoreService → stores scan results, handles CSV export             │
+  │  ConfigurationService → user preferences (backend URL, defaults)        │
+  │  ToastService → application-wide notifications                          │
+  └────────────────────────────────────────┬─────────────────────────────────┘
+                                           │ use
+  ┌──────────────────────────────────────▼─────────────────────────────────┐
+  │  INTERCEPTORS  (cross-cutting HTTP concerns)                            │
+  │  AuthInterceptor → attaches JWT token to every outgoing request         │
+  │  ErrorInterceptor → handles 401/429/503/500 responses globally          │
+  └────────────────────────────────────────┬─────────────────────────────────┘
+                                           │ all HTTP flows through
+  ┌──────────────────────────────────────▼─────────────────────────────────┐
+  │  HTTPCLIENT  (Angular's HTTP layer)                                     │
+  │  Makes the actual HTTP calls to the backend REST API                    │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  SHARED COMPONENTS  (dumb components — accept inputs, emit outputs)      │
+  │  IpInputComponent, CredentialFormComponent, MethodSelectorComponent      │
+  │  ProgressBarComponent, ScanResultTableComponent, AssetDetailPanel        │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LAYOUTS  (shell components — provide sidebar, topbar, router outlet)    │
+  │  DashboardLayout, AuthenticationLayout, EmptyLayout                      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  GUARDS  (route-level access control)                                    │
+  │  AuthGuard (protect dashboard), GuestGuard (redirect logged-in users)   │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  3. BACKEND ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Technology Stack
+  ─────────────────
+  ┌────────────────────────┬──────────────────────────────────────────────────┐
+  │ Component              │ Technology & Version                             │
+  ├────────────────────────┼──────────────────────────────────────────────────┤
+  │ Runtime                │ Node.js 18 LTS                                   │
+  │ Language               │ TypeScript (ES2020, strict mode)                 │
+  │ HTTP Framework         │ Express 4                                        │
+  │ Input Validation       │ Zod 3                                            │
+  │ SSH Client             │ ssh2 1.16                                        │
+  │ WMI Client (native)    │ node-wmi 0.0.5                                   │
+  │ Logging                │ Winston 3 + daily-rotate-file                    │
+  │ Security               │ Helmet 7 + express-rate-limit 7                  │
+  │ ID Generation          │ uuid 9                                           │
+  │ Environment Config     │ dotenv 16                                        │
+  │ Container              │ Docker (node:18-alpine)                          │
+  └────────────────────────┴──────────────────────────────────────────────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+  3.1  NODE.JS 18 LTS  (Runtime)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Node.js is a server-side JavaScript runtime built on Chrome's V8 engine.
+    It uses an event-driven, non-blocking I/O model that makes it efficient
+    for I/O-heavy workloads.
+
+  WHY NODE.JS FOR A NETWORK SCANNER:
+    Network scanning is almost entirely I/O-bound work — waiting for ping
+    replies, waiting for WinRM handshakes, waiting for PowerShell scripts to
+    finish. Node.js is built exactly for this use case: it can have 50 scans
+    in progress simultaneously without 50 threads, because while one scan
+    waits for a network response, the event loop runs another.
+
+  BENEFIT:
+    - A single Node.js process can handle dozens of concurrent scans without
+      the overhead of OS threads
+    - Native async/await syntax makes the scan pipeline (ping → connect →
+      hardware → software) readable and maintainable
+    - The same language (TypeScript) is used on both frontend and backend,
+      meaning types can be shared and developers do not need to context-switch
+    - LTS (Long Term Support) version 18 is stable and supported until 2025+
+
+────────────────────────────────────────────────────────────────────────────────
+  3.2  EXPRESS 4  (HTTP Framework)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Express is the most widely used HTTP server framework for Node.js.
+    It provides routing, middleware chaining, and request/response handling.
+
+  HOW IT IS USED IN NET-SCAN:
+    Express handles all 6 API endpoints. The middleware stack runs on every
+    request in this order:
+      Helmet → CORS → Rate Limiter → Body Parser → Request Logger → Routes
+    Route handlers delegate to ScannerController which delegates to
+    ScannerService. Errors are caught by a global error middleware.
+
+  BENEFIT:
+    - Minimal and unopinionated — only adds what is needed
+    - Middleware pattern makes it easy to add cross-cutting concerns
+      (security, logging, rate limiting) without touching business logic
+    - Well-tested, massive ecosystem, extensive documentation
+    - Supports graceful shutdown (10-second timeout before forced exit)
+      so in-progress scans are not abruptly killed on deploy
+
+────────────────────────────────────────────────────────────────────────────────
+  3.3  TYPESCRIPT (STRICT MODE)  (Language)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    TypeScript is a strongly typed superset of JavaScript. Strict mode
+    enforces the most rigorous type checking — no implicit any, no unused
+    variables, no unchecked nulls.
+
+  HOW IT IS USED IN NET-SCAN:
+    The entire backend is written in TypeScript. All scan data shapes
+    (HardwareInfo, SoftwareEntry, ScanResult, ScanCredentials) are defined
+    as TypeScript interfaces. The compiler catches any mismatch between
+    what the scanner returns and what the controller expects.
+
+  BENEFIT:
+    - Type errors caught at compile time, not at runtime in production
+    - Interfaces act as contracts between layers — if the scanner service
+      changes the shape of HardwareInfo, every consumer that uses the
+      old shape will immediately show a compile error
+    - Strict null checks prevent "cannot read property of undefined"
+      crashes that are common in plain JavaScript
+    - IDE autocomplete makes development faster and less error-prone
+
+────────────────────────────────────────────────────────────────────────────────
+  3.4  ZOD 3  (Input Validation)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Zod is a TypeScript-first schema validation library. You define a schema
+    (what valid input looks like) and Zod validates incoming data against it,
+    returning either parsed safe data or a structured list of errors.
+
+  HOW IT IS USED IN NET-SCAN:
+    Every API endpoint has a Zod schema. A validate() middleware runs before
+    every controller. If the request body does not match the schema, a 400
+    error is returned immediately with a human-readable list of what is wrong.
+    If it passes, req.body is replaced with the parsed, type-safe object
+    (including default values for optional fields).
+
+  BENEFIT:
+    - Invalid input (bad IP format, missing credentials, unknown scan method)
+      is rejected before any network call is made — zero wasted compute
+    - Zod infers TypeScript types from schemas automatically, so there is
+      a single source of truth for both validation rules and types
+    - Default values are applied automatically (skipPing=false,
+      continueOnError=true) without manual if/else in every handler
+    - Structured error output tells the client exactly which field failed
+      and why, enabling the frontend to show field-level error messages
+
+────────────────────────────────────────────────────────────────────────────────
+  3.5  HELMET 7  (HTTP Security Headers)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Helmet is an Express middleware that sets HTTP response headers to protect
+    against well-known web vulnerabilities.
+
+  HOW IT IS USED IN NET-SCAN:
+    Applied as the first middleware in the Express stack so every response
+    gets security headers regardless of which route is hit.
+
+  HEADERS SET BY HELMET:
+    X-Content-Type-Options: nosniff    — prevents MIME sniffing attacks
+    X-Frame-Options: DENY              — prevents clickjacking
+    Content-Security-Policy            — controls what resources can load
+    Strict-Transport-Security (HSTS)   — forces HTTPS in browsers
+    X-XSS-Protection                   — legacy XSS filter for older browsers
+    Referrer-Policy                    — controls referrer header leakage
+
+  BENEFIT:
+    - One line of code adds 11 security headers that would otherwise require
+      manual configuration per route
+    - Protects against common attacks without any application-level changes
+    - Industry standard — used by the majority of production Node.js APIs
+
+────────────────────────────────────────────────────────────────────────────────
+  3.6  EXPRESS-RATE-LIMIT 7  (Rate Limiting)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    A middleware that counts requests per IP address within a sliding time
+    window and rejects requests that exceed the configured limit.
+
+  HOW IT IS USED IN NET-SCAN:
+    Applied globally in Express. Default window: 60 seconds. Default max:
+    100 requests per IP per window. Both are configurable via environment
+    variables (RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX).
+
+  BENEFIT:
+    - Prevents a single client from flooding the server with scan requests
+      and consuming all resources
+    - Protects against brute-force credential testing (an attacker cannot
+      rapidly try thousands of credential combinations)
+    - Returns HTTP 429 (Too Many Requests) with a Retry-After header
+      so legitimate clients can back off and retry automatically
+
+────────────────────────────────────────────────────────────────────────────────
+  3.7  WINSTON 3 + DAILY-ROTATE-FILE  (Logging)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    Winston is the most popular Node.js structured logging library.
+    daily-rotate-file is a Winston transport that writes logs to dated files
+    and automatically deletes old logs.
+
+  HOW IT IS USED IN NET-SCAN:
+    Two log files are maintained:
+      app-YYYY-MM-DD.log   — all log levels, 20MB max, 14-day retention
+      error-YYYY-MM-DD.log — errors only, 30-day retention
+    In development, logs are printed to console in colorized format.
+    In production, logs are written as JSON (parseable by log aggregators).
+    A custom scrubber strips "password" fields from all log entries before
+    they are written.
+
+  BENEFIT:
+    - Structured JSON logs can be ingested by monitoring tools (Datadog,
+      ELK stack, CloudWatch) without parsing plain text
+    - Password scrubbing ensures credentials never appear in log files even
+      if a bug passes them into a logging call
+    - Automatic rotation prevents logs from filling disk space on long-running
+      servers
+    - Every request gets a UUID request ID attached — used to trace a single
+      request through all log entries for debugging
+
+────────────────────────────────────────────────────────────────────────────────
+  3.8  SSH2  (SSH Client Library)
+────────────────────────────────────────────────────────────────────────────────
+
+  WHAT IT IS:
+    ssh2 is a pure JavaScript SSH client for Node.js. It implements the
+    SSH2 protocol, supports both password and keyboard-interactive
+    authentication, and handles the encrypted transport layer.
+
+  HOW IT IS USED IN NET-SCAN:
+    The SshMethod uses ssh2 to open encrypted SSH sessions to target
+    machines and execute shell commands (systeminfo, ipconfig, reg query,
+    wmic) remotely. One connection is opened per scan and reused for all
+    commands, then closed.
+
+  BENEFIT:
+    - No child process spawned — the SSH session is handled entirely within
+      Node.js, consuming fewer file descriptors and less RAM than spawning
+      a native ssh.exe process per scan
+    - Supports keyboard-interactive authentication that Windows OpenSSH
+      Server uses (plain password auth is often disabled on Windows)
+    - Legacy key-exchange algorithms (diffie-hellman-group14-sha1) are
+      supported for compatibility with older Windows SSH servers
+    - Per-command timeouts prevent a hung remote command from blocking the
+      scan indefinitely
+
+────────────────────────────────────────────────────────────────────────────────
+  3.9  BACKEND INTERNAL ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+  The backend follows a layered architecture with clear responsibilities:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  EXPRESS MIDDLEWARE CHAIN  (runs on every request)                       │
+  │  Helmet → CORS → RateLimit → BodyParser → RequestLogger → Routes        │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │ passes to
+  ┌──────────────────────▼───────────────────────────────────────────────────┐
+  │  ROUTES + VALIDATION  (scanner.routes.ts + scanner.validation.ts)        │
+  │  validate(zodSchema) middleware runs before every controller method       │
+  │  Rejects invalid input with 400 before any business logic runs           │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │ passes to
+  ┌──────────────────────▼───────────────────────────────────────────────────┐
+  │  CONTROLLER  (scanner.controller.ts)                                     │
+  │  Thin layer — extracts request data, calls service, formats response     │
+  │  Uses successResponse() wrapper for consistent response envelope         │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │ calls
+  ┌──────────────────────▼───────────────────────────────────────────────────┐
+  │  SERVICE  (scanner.service.ts)                                           │
+  │  Core business logic — orchestrates 4-step scan pipeline                 │
+  │  Normalizes data from all methods into one consistent shape              │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │ delegates to
+  ┌──────────────────────▼───────────────────────────────────────────────────┐
+  │  METHOD FACTORY  (method.factory.ts)                                     │
+  │  Singleton cache — returns the correct scan method implementation        │
+  │  getMethod("powershell") → PowerShellMethod instance                     │
+  └──────────────────────────────────────────────────────────────────────────┘
+                           │ routes to one of
+  ┌──────────┬─────────────┬──────────┬─────────────────────────────────────┐
+  │PowerShell│     WMI     │   SSH    │          Node-WMI                    │
+  │ Method   │   Method    │  Method  │           Method                     │
+  │(WinRM)   │ (cscript)   │  (ssh2)  │         (node-wmi)                   │
+  └──────────┴─────────────┴──────────┴─────────────────────────────────────┘
+                           │ use
+  ┌──────────────────────▼───────────────────────────────────────────────────┐
+  │  UTILITIES  (utils/)                                                     │
+  │  ping.util → ICMP ping via OS ping command                               │
+  │  powershell.util → write temp file, spawn powershell.exe, parse JSON     │
+  │  ssh.util → TCP check, systeminfo/ipconfig/reg-query parsers             │
+  │  vbscript.util → write temp file, spawn cscript.exe, parse JSON         │
+  │  response.util → successResponse / failureResponse envelope builders     │
+  │  app-error.util → AppError class with HTTP status + error code           │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  4. HOW API CALLS ARE MADE — COMPLETE FLOW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  The following shows exactly which component is responsible at each step
+  of an API call, from user click to backend response back in the UI.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  USER CLICKS "START SCAN" ON SCANNINGPAGE                               │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCANNINGPAGE (Angular Component)                                        │
+  │  Collects: target IPs, selected method, credentials, scan options       │
+  │  Validates form locally via Reactive Forms                               │
+  │  Calls: scannerService.fullScan(options)                                │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCANNERSERVICE (Angular Service)                                        │
+  │  Builds the HTTP request body (typed as FullScanOptions interface)       │
+  │  Calls: httpClient.post<ApiResponse<ScanResult>>(url, body)             │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  AUTHINTERCEPTOR (Angular HTTP Interceptor)                              │
+  │  Reads JWT token from localStorage                                       │
+  │  Adds header: Authorization: Bearer <token>                             │
+  │  Forwards modified request                                               │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼  HTTP POST /api/v1/scanner/scan
+  ══════════════════════════════════════════════════════════════════════════
+                    NETWORK BOUNDARY (Frontend → Backend)
+  ══════════════════════════════════════════════════════════════════════════
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  EXPRESS MIDDLEWARE CHAIN (Backend)                                      │
+  │  1. Helmet adds security headers to response                            │
+  │  2. CORS checks Origin header against whitelist                         │
+  │  3. RateLimit checks request count for this IP                          │
+  │  4. BodyParser parses JSON body into req.body                           │
+  │  5. RequestLogger attaches UUID + timestamp to res.locals               │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCANNER ROUTES + ZOD VALIDATION (Backend)                              │
+  │  validate(fullScanSchema) middleware:                                    │
+  │    - Checks target is valid IPv4 or hostname                            │
+  │    - Checks method is one of: powershell/wmi/ssh/node-wmi               │
+  │    - Checks username + password are present                             │
+  │    - Applies defaults: skipPing=false, continueOnError=true             │
+  │  On failure → 400 AppError thrown → error middleware formats response   │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCANNERCONTROLLER (Backend)                                            │
+  │  Extracts validated body                                                │
+  │  Calls: scannerService.fullScan(options)                                │
+  │  Wraps result in successResponse() envelope                             │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCANNERSERVICE (Backend)                                               │
+  │  Step 1: pingHost(target) — ICMP check                                  │
+  │  Step 2: getMethod(method).testConnection(target, credentials)          │
+  │  Step 3: getMethod(method).fetchHardwareInfo(target, credentials)       │
+  │          → normalizeHardware() flattens field names                      │
+  │  Step 4: getMethod(method).fetchSoftwareInfo(target, credentials)       │
+  │          → normalizeSoftware() adds timestamps + CSV aliases            │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼  HTTP 200 JSON response
+  ══════════════════════════════════════════════════════════════════════════
+                    NETWORK BOUNDARY (Backend → Frontend)
+  ══════════════════════════════════════════════════════════════════════════
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  ERRORINTERCEPTOR (Angular HTTP Interceptor)                             │
+  │  If 401 → clear token, redirect to /auth/sign-in                       │
+  │  If 429 → show "Rate limit reached" toast                               │
+  │  If 5xx → show error toast                                              │
+  │  If 200 → pass response through to ScannerService                       │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCANNERSERVICE (Angular) receives Observable response                  │
+  │  Emits typed ScanResult to ScanningPage                                 │
+  └─────────────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  SCANNINGPAGE updates UI                                                │
+  │  → Result row flips from "Running" to "Done" or "Failed"               │
+  │  → ScanStoreService.addResult(result) → saved to localStorage          │
+  │  → Progress bar increments                                              │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  5. SCAN METHOD ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Four interchangeable scan methods are built on a common abstract base.
+  This is the Strategy design pattern — the caller (ScannerService) does not
+  know or care which method is used; it always calls the same interface.
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  BaseMethod (abstract)                                                  │
+  │  Defines the interface all methods must implement:                      │
+  │    testConnection(target, credentials)                                  │
+  │    fetchHardwareInfo(target, credentials)                               │
+  │    fetchSoftwareInfo(target, credentials)                               │
+  │  Provides shared helpers: parseJson(), assertSuccess()                  │
+  └──────┬──────────────┬──────────────────┬─────────────────┬─────────────┘
+         │              │                  │                 │
+  ┌──────▼──────┐ ┌─────▼──────┐  ┌───────▼───────┐ ┌──────▼──────┐
+  │ PowerShell  │ │    WMI     │  │     SSH       │ │  Node-WMI  │
+  │  Method     │ │   Method   │  │    Method     │ │   Method   │
+  │             │ │            │  │               │ │            │
+  │ Transport:  │ │ Transport: │  │ Transport:    │ │ Transport: │
+  │ WinRM       │ │ DCOM/RPC   │  │ SSH (ssh2)    │ │ DCOM/RPC   │
+  │ Port: 5985  │ │ Port: 135  │  │ Port: 22      │ │ Port: 135  │
+  │             │ │            │  │               │ │            │
+  │ Execution:  │ │ Execution: │  │ Execution:    │ │ Execution: │
+  │ spawn       │ │ spawn      │  │ ssh2 library  │ │ node-wmi   │
+  │ powershell  │ │ cscript    │  │ (no process)  │ │ (no file)  │
+  │ .exe        │ │ .exe       │  │               │ │            │
+  └─────────────┘ └────────────┘  └───────────────┘ └────────────┘
+
+  BENEFIT OF THIS PATTERN:
+    Adding a fifth scan method (e.g., SNMP) only requires creating a new class
+    that extends BaseMethod and adding one case to the method factory. The
+    service, controller, routes, and validation require zero changes.
+
+  METHOD SELECTION GUIDE:
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │ If WinRM (port 5985) is open on target   → Use PowerShell  (best data) │
+  │ If only SSH (port 22) is open            → Use SSH         (good data)  │
+  │ If only DCOM/RPC (port 135) is open      → Use WMI         (good data)  │
+  │ If on Windows server, no child processes → Use Node-WMI    (clean)      │
+  └──────────────────────────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  6. SCALABILITY ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+  6.1  CURRENT SCALABILITY (Built-in, No Changes Needed)
+────────────────────────────────────────────────────────────────────────────────
+
+  STATELESS BACKEND:
+    The backend holds zero state between requests. No sessions, no in-memory
+    scan history, no shared mutable data. Every request carries everything
+    it needs. This means any number of backend instances can run behind a
+    load balancer and any instance can handle any request.
+
+  NODE.JS ASYNC CONCURRENCY:
+    The event loop handles multiple concurrent scans without threads.
+    While one scan waits for a WinRM response, another scan's SSH command
+    runs. This is not parallelism in the CPU sense — it is concurrency in
+    the I/O sense, which is exactly what network scanning requires.
+
+  METHOD SINGLETON CACHING:
+    The Method Factory caches one instance of each scan method class per
+    process (PowerShellMethod, WmiMethod, SshMethod, NodeWmiMethod).
+    There is no repeated construction overhead on subsequent scans.
+
+────────────────────────────────────────────────────────────────────────────────
+  6.2  HORIZONTAL SCALING (Add More Servers)
+────────────────────────────────────────────────────────────────────────────────
+
+  Because the backend is stateless, horizontal scaling is straightforward:
+
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │  LOAD BALANCER  (nginx / AWS ALB / Azure Application Gateway)            │
+  │  Distributes requests across backend instances                           │
+  │  No sticky sessions needed (backend is stateless)                       │
+  └──────────────────────┬───────────────┬──────────────────────────────────┘
+                         │               │
+              ┌──────────▼─────┐ ┌───────▼──────────┐
+              │ Backend Node 1  │ │  Backend Node 2  │ ...
+              │ (Docker/VM)    │ │  (Docker/VM)     │
+              └─────────────────┘ └──────────────────┘
+
+  BENEFIT:
+    - Double the instances → double the throughput
+    - If one instance crashes, the load balancer routes to the others
+      (zero downtime)
+    - Instances can be added and removed without any code changes
+
+────────────────────────────────────────────────────────────────────────────────
+  6.3  JOB QUEUE SCALING  (For 1,000+ IPs)
+────────────────────────────────────────────────────────────────────────────────
+
+  COMPONENTS NEEDED:
+
+  ┌─────────────────┐   adds jobs   ┌──────────────┐   pulls jobs  ┌───────────────┐
+  │  API Server     │ ────────────► │  Redis Queue │ ────────────► │  Workers      │
+  │  (thin layer)   │               │  (BullMQ)    │               │  (scan pool)  │
+  │  Returns job ID │               │              │               │  50 concurrent│
+  │  immediately    │               │  Persists    │               │  per process  │
+  └─────────────────┘               │  across      │               └───────────────┘
+                                    │  restarts    │
+                                    └──────────────┘
+                                           │ completed jobs
+                                           ▼
+                                    ┌──────────────┐
+                                    │  Database    │
+                                    │  (Postgres)  │
+                                    │  Stores all  │
+                                    │  results     │
+                                    └──────────────┘
+
+  Redis (via BullMQ):
+    Acts as the job buffer between the API and the workers. When 10,000
+    scan jobs arrive, Redis holds them until a worker is free to process
+    each one. Redis persists jobs to disk so they survive server restarts.
+    BullMQ handles automatic retries for failed jobs, job prioritization,
+    and rate limiting per queue.
+
+  BENEFIT OF REDIS + BULLMQ:
+    - The API server never blocks waiting for a scan to finish — it queues
+      the job and returns a batch ID in under 1 second regardless of batch size
+    - Workers process at a controlled rate (50 concurrent per worker) so
+      the server never gets overwhelmed
+    - Failed scans are automatically retried without client intervention
+    - Queue depth is observable — you can add workers dynamically when
+      the queue grows (auto-scaling trigger)
+
+  Worker Concurrency Control:
+    Each worker process processes N jobs simultaneously. Since Node.js
+    is async, "50 concurrent" means 50 scans are in-flight (waiting for
+    network I/O) at any time — not 50 CPU threads.
+
+    10 workers × 50 concurrency = 500 simultaneous scans
+    10,000 IPs ÷ 500 = 20 rounds × 90s avg = ~30 minutes total
+
+────────────────────────────────────────────────────────────────────────────────
+  6.4  KUBERNETES / CONTAINER SCALING
+────────────────────────────────────────────────────────────────────────────────
+
+  The backend ships as a Docker image (node:18-alpine, port 3000).
+  This makes it deployable to any container orchestration platform:
+
+  On Kubernetes (EKS, GKE, AKS):
+    - API Deployment: 2-4 replicas, HPA on CPU
+    - Worker Deployment: 5-20 replicas, HPA on queue depth metric
+    - Redis: single instance or Redis Cluster for HA
+    - Postgres: managed RDS/CloudSQL for results
+
+  HPA (Horizontal Pod Autoscaler) Triggers:
+    - API pods: scale on CPU (high CPU = many concurrent connections)
+    - Worker pods: scale on Redis queue depth > 500 pending jobs
+      → add more workers automatically
+
+  BENEFIT:
+    - No manual intervention to scale up for a large batch and scale
+      down when it finishes — Kubernetes handles it automatically
+    - Rolling deployments with zero downtime (old pods serve while new
+      pods start up)
+    - Self-healing: crashed pods are automatically restarted
+
+────────────────────────────────────────────────────────────────────────────────
+  6.5  SCALABILITY COMPONENT BENEFIT SUMMARY
+────────────────────────────────────────────────────────────────────────────────
+
+  ┌───────────────────────────┬──────────────────────────────────────────────┐
+  │ Component                 │ Scalability Benefit                          │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ Stateless backend         │ Any instance handles any request — add more  │
+  │                           │ servers without coordination                 │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ Node.js async I/O         │ 50+ concurrent scans per process without     │
+  │                           │ threads or extra memory overhead             │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ Docker container          │ Identical, reproducible deployments anywhere │
+  │                           │ — laptop, VM, or Kubernetes cluster          │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ Load balancer             │ Distribute traffic across N backend instances│
+  │ (nginx / ALB)             │ — linear throughput scaling                  │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ Redis (BullMQ queue)      │ Decouple request acceptance from execution   │
+  │                           │ — accept 10,000 jobs instantly, process at   │
+  │                           │ controlled rate, survive restarts            │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ BullMQ workers            │ Controlled concurrency pool — N workers ×    │
+  │                           │ 50 concurrent = linear throughput scaling    │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ Postgres (results DB)     │ Store millions of scan results durably with  │
+  │                           │ JSONB for flexible hardware/software schema  │
+  ├───────────────────────────┼──────────────────────────────────────────────┤
+  │ Kubernetes HPA            │ Auto-add/remove worker pods based on queue   │
+  │                           │ depth — cost-efficient at variable load      │
+  └───────────────────────────┴──────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  7. SECURITY ARCHITECTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌─────────────────────┬─────────────────────────────────────────────────────┐
+  │ Threat              │ Control & Component                                 │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ Bad input / inject  │ Zod schema validates every field before any logic   │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ Credential leakage  │ Passwords embedded in script body (temp file),      │
+  │ in process list     │ never in process arguments. Winston scrubs           │
+  │                     │ "password" fields from all log entries.             │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ Script injection    │ escapePsString() and escapeVbsString() sanitize     │
+  │ via credentials     │ user-supplied values before embedding in scripts    │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ Abandoned temp files│ Temp .ps1 and .vbs files deleted in finally-        │
+  │                     │ equivalent cleanup regardless of success/failure    │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ DDoS / flooding     │ express-rate-limit (100 req / 60s per IP)           │
+  │                     │ CORS whitelist (only known origins accepted)        │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ Clickjacking / XSS  │ Helmet (X-Frame-Options, CSP, X-XSS-Protection)    │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ Hung processes      │ Per-operation timeouts kill child processes and     │
+  │                     │ SSH streams that exceed configured limits           │
+  ├─────────────────────┼─────────────────────────────────────────────────────┤
+  │ Error info leakage  │ AppError details field (stderr content) is logged   │
+  │                     │ server-side only — the HTTP response never includes │
+  │                     │ raw script errors or stack traces to the client     │
+  └─────────────────────┴─────────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  8. COMPLETE COMPONENT BENEFIT REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  FRONTEND COMPONENTS
+  ────────────────────
+  ┌─────────────────────────┬────────────────────────────────────────────────┐
+  │ Component               │ Benefit                                        │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Angular 21              │ Structured, typed, maintainable UI codebase.   │
+  │                         │ Signals for efficient reactive updates.         │
+  │                         │ Lazy loading keeps startup fast.               │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Electron 41             │ Native desktop app. Works offline. No browser  │
+  │                         │ restrictions. Distributed as .exe installer.   │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Angular Material 21     │ 40+ production-quality UI components.          │
+  │                         │ Virtual scroll for 10,000-row tables.          │
+  │                         │ Full accessibility support out of the box.     │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Angular HttpClient      │ Typed HTTP calls. Interceptor support.         │
+  │                         │ Observable-based — UI stays responsive.        │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ AuthInterceptor         │ Adds auth token to every request in one place. │
+  │                         │ No per-service boilerplate.                    │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ ErrorInterceptor        │ Handles 401/429/5xx in one place globally.     │
+  │                         │ No error handling in every service method.     │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Angular Reactive Forms  │ Client-side validation before API call.        │
+  │                         │ Prevents sending bad data to backend.          │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ ScannerService          │ Single place for all backend calls.            │
+  │                         │ Components never use HttpClient directly.      │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ ScanStoreService        │ Shared result state between all pages.         │
+  │                         │ Scan once, view results from any page.         │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ AuthGuard / GuestGuard  │ Route-level access control. Users cannot       │
+  │                         │ bypass auth by typing a URL directly.          │
+  └─────────────────────────┴────────────────────────────────────────────────┘
+
+  BACKEND COMPONENTS
+  ───────────────────
+  ┌─────────────────────────┬────────────────────────────────────────────────┐
+  │ Component               │ Benefit                                        │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Node.js 18              │ Async I/O handles 50+ concurrent scans in one  │
+  │                         │ process. No threading complexity.              │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Express 4               │ Lightweight HTTP server. Middleware chain is   │
+  │                         │ simple to read and extend.                     │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ TypeScript (strict)     │ Compile-time type safety across all layers.    │
+  │                         │ Single language for frontend and backend.      │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Zod 3                   │ Request validation with zero boilerplate.      │
+  │                         │ Rejects bad input before any I/O is done.     │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Helmet 7                │ 11 security headers in one middleware call.    │
+  │                         │ Industry-standard protection against web       │
+  │                         │ vulnerabilities.                               │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ express-rate-limit      │ Protects against flooding and brute-force.     │
+  │                         │ Configurable per deployment environment.       │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Winston + rotate        │ Structured JSON logs. Password scrubbing.      │
+  │                         │ Automatic file rotation. Retention policies.   │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ ssh2                    │ No child process for SSH. Low RAM footprint.   │
+  │                         │ Supports legacy Windows OpenSSH auth.          │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ BaseMethod + Factory    │ Strategy pattern. Adding a new scan method     │
+  │ (Strategy Pattern)      │ requires zero changes to existing code.        │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Normalization layer     │ One data shape regardless of scan method.      │
+  │ (normalizeHardware /    │ Frontend and exports never need to adapt to    │
+  │  normalizeSoftware)     │ method-specific field names.                   │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ AppError class          │ All errors carry HTTP status + machine-readable│
+  │                         │ code + optional debug details. Consistent      │
+  │                         │ error handling across all 28 source files.     │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Docker (alpine)         │ Minimal image (node:18-alpine ≈ 100MB).        │
+  │                         │ Reproducible builds. Runs anywhere.            │
+  └─────────────────────────┴────────────────────────────────────────────────┘
+
+  SCALABILITY COMPONENTS (to be added)
+  ──────────────────────────────────────
+  ┌─────────────────────────┬────────────────────────────────────────────────┐
+  │ Component               │ Benefit                                        │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Redis                   │ Distributed job queue storage. Persists across │
+  │                         │ restarts. Shared by all worker instances.      │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ BullMQ                  │ Job queue on top of Redis. Concurrency control.│
+  │                         │ Automatic retries. Job prioritization.         │
+  │                         │ Queue depth monitoring.                        │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Postgres (JSONB)        │ Durable result storage. Handles millions of    │
+  │                         │ scan records. JSONB column stores flexible     │
+  │                         │ hardware/software JSON without schema changes. │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Load Balancer           │ Distributes requests evenly. Removes failed    │
+  │ (nginx / AWS ALB)       │ instances automatically. No single point of   │
+  │                         │ failure.                                       │
+  ├─────────────────────────┼────────────────────────────────────────────────┤
+  │ Kubernetes HPA          │ Auto-scales worker pods based on queue depth.  │
+  │                         │ Scale up for large batches, down when idle.    │
+  │                         │ Cost-efficient at variable load.               │
+  └─────────────────────────┴────────────────────────────────────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  9. ARCHITECTURE DECISION RECORD (Why These Choices Were Made)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  WHY NODE.JS INSTEAD OF PYTHON / JAVA / .NET?
+    Network scanning is I/O-bound, not CPU-bound. Node.js's async event loop
+    handles high I/O concurrency without the complexity of threads. Python
+    and Java require thread pools to handle concurrent I/O. .NET would be
+    platform-restricted. Node.js also enables shared TypeScript types between
+    frontend and backend.
+
+  WHY EXPRESS INSTEAD OF FASTIFY / NestJS?
+    Express is the simplest choice for a focused REST API with 6 endpoints.
+    Fastify offers slightly better performance at extreme scale, but the
+    bottleneck in this system is network I/O (WinRM/SSH/DCOM), not the HTTP
+    framework. NestJS adds complexity (decorators, modules) not justified
+    by the current scope.
+
+  WHY ANGULAR INSTEAD OF REACT / VUE?
+    Angular provides a complete, opinionated solution — routing, forms, HTTP
+    client, and dependency injection are built in. React requires assembling
+    these from separate libraries. For an enterprise desktop application with
+    multiple complex pages and a team that needs consistent conventions,
+    Angular's structure is a benefit, not a constraint.
+
+  WHY ELECTRON INSTEAD OF A WEB APP?
+    The target users are IT administrators who scan corporate networks from
+    their workstations. An Electron app works offline, can be deployed via
+    corporate software distribution (SCCM/Intune), requires no server
+    infrastructure for the UI, and can access local file system for
+    importing IP lists and exporting reports.
+
+  WHY ZOD INSTEAD OF JOI / EXPRESS-VALIDATOR?
+    Zod is TypeScript-first — it infers TypeScript types from schemas
+    automatically, eliminating the dual maintenance of type definitions
+    and validation rules. Joi requires manual type synchronization.
+
+  WHY FOUR SCAN METHODS?
+    No single protocol works in every corporate environment:
+    - PowerShell Remoting is often disabled on servers for security reasons
+    - WMI/DCOM is blocked by firewalls between network segments
+    - SSH requires OpenSSH Server which is optional on Windows
+    Supporting all four methods means the tool works regardless of which
+    protocols are available in a given network.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  10. CURRENT STATE vs TARGET STATE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ┌──────────────────────────────┬──────────────────────────────────────────┐
+  │ CURRENT STATE (Built)        │ TARGET STATE (To Build)                  │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Backend REST API (6 endpoints│ Add bulk scan endpoint + polling         │
+  │ fully working)               │ endpoint for 10,000+ IP batches          │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ 4 scan methods (PS, WMI,     │ No changes needed — methods are          │
+  │ SSH, Node-WMI) all working   │ extensible via BaseMethod pattern         │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Frontend app shell (routes,  │ Implement all 6 dashboard pages,         │
+  │ layouts, empty page shells)  │ services, interceptors, and components   │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Single-instance backend      │ Add Redis + BullMQ + Worker process +    │
+  │ (synchronous scan execution) │ Postgres for large batch processing      │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ Docker container ready       │ Add Kubernetes manifests and HPA config  │
+  │                              │ for auto-scaling worker deployment        │
+  ├──────────────────────────────┼──────────────────────────────────────────┤
+  │ No user authentication       │ Add auth service (JWT, user management)  │
+  │                              │ and wire up AuthGuard / GuestGuard       │
+  └──────────────────────────────┴──────────────────────────────────────────┘
+
+================================================================================
+  END OF TECHNICAL ARCHITECTURE DOCUMENT
+================================================================================
